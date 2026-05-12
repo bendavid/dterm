@@ -453,8 +453,23 @@ export function activate(ctx: vscode.ExtensionContext): void {
         vscode.window.onDidOpenTerminal(t => {
             const name = sessionNameOf(t);
             if (name && pendingFocus.has(name)) {
-                pendingFocus.delete(name);
-                t.show();
+                const pty = ptyOf(t);
+                if (pty?.ready) {
+                    pendingFocus.delete(name);
+                    t.show();
+                } else if (pty) {
+                    const sub = pty.onDidReady(() => {
+                        sub.dispose();
+                        if (pendingFocus.delete(name)) t.show();
+                    });
+                    setTimeout(() => {
+                        sub.dispose();
+                        pendingFocus.delete(name);
+                    }, 10000);
+                } else {
+                    pendingFocus.delete(name);
+                    t.show();
+                }
             }
             snapshotLabels(ctx);
             ensurePolling(ctx);

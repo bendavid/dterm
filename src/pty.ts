@@ -18,13 +18,17 @@ export class DtermPseudoterminal implements vscode.Pseudoterminal {
     private writeEmitter = new vscode.EventEmitter<string>();
     private closeEmitter = new vscode.EventEmitter<number | void>();
     private nameEmitter = new vscode.EventEmitter<string>();
+    private readyEmitter = new vscode.EventEmitter<void>();
 
     readonly onDidWrite = this.writeEmitter.event;
     readonly onDidClose = this.closeEmitter.event;
     readonly onDidChangeName = this.nameEmitter.event;
+    readonly onDidReady = this.readyEmitter.event;
 
     private conn = new DaemonConnection();
     private opened = false;
+
+    get ready(): boolean { return this.opened; }
     private failed = false;
     private pendingInput: string[] = [];
     private pendingResize: vscode.TerminalDimensions | undefined;
@@ -144,6 +148,7 @@ export class DtermPseudoterminal implements vscode.Pseudoterminal {
                     this.conn.send({ type: 'input', data: Buffer.from(data, 'utf8').toString('base64') });
                 }
                 this.pendingInput.length = 0;
+                this.readyEmitter.fire();
                 return;
             }
             case 'output': {
