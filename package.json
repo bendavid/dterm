@@ -107,7 +107,7 @@
     "compile": "tsc -p . && mv -f out/wrapper.js out/dterm-wrapper && chmod +x out/dterm-wrapper",
     "watch": "tsc -p . -w",
     "clean-staged-prebuild": "rm -rf node_modules/node-pty/prebuilds/linux-x64 node_modules/node-pty/prebuilds/linux-arm64",
-    "vscode:prepublish": "npm run compile && npm run clean-staged-prebuild"
+    "vscode:prepublish": "npm run compile"
   },
   "dependencies": {
     "node-pty": "^1.1.0"

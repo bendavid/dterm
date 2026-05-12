@@ -1,0 +1,71 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  package:
+    name: Package (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux-x64
+            runs-on: ubuntu-24.04
+          - target: linux-arm64
+            runs-on: ubuntu-24.04-arm
+          - target: darwin-x64
+            runs-on: macos-13
+          - target: darwin-arm64
+            runs-on: macos-14
+    runs-on: ${{ matrix.runs-on }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Strip non-target node-pty prebuilds
+        shell: bash
+        run: |
+          ls node_modules/node-pty/prebuilds
+          find node_modules/node-pty/prebuilds -mindepth 1 -maxdepth 1 -type d \
+            ! -name '${{ matrix.target }}' -exec rm -rf {} +
+          echo "After strip:"
+          ls node_modules/node-pty/prebuilds
+
+      - name: Package extension
+        run: npx --yes @vscode/vsce@latest package --target ${{ matrix.target }} --out dterm-${{ matrix.target }}.vsix
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dterm-${{ matrix.target }}
+          path: dterm-${{ matrix.target }}.vsix
+          if-no-files-found: error
+
+  release:
+    name: Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: package
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${{ github.ref_name }}" artifacts/*.vsix --title "${{ github.ref_name }}" --generate-notes
