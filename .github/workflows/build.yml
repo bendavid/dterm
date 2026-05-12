@@ -95,7 +95,17 @@ jobs:
           if-no-files-found: error
 
   darwin:
-    name: Package (darwin-arm64)
+    name: Package (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: darwin-arm64
+            npm_arch: arm64
+            clang_arch: arm64
+          - target: darwin-x64
+            npm_arch: x64
+            clang_arch: x86_64
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
@@ -108,22 +118,49 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Strip non-target node-pty prebuilds
-        shell: bash
+      - name: Configure clang for -arch ${{ matrix.clang_arch }}
         run: |
-          ls node_modules/node-pty/prebuilds
-          find node_modules/node-pty/prebuilds -mindepth 1 -maxdepth 1 -type d \
-            ! -name 'darwin-arm64' -exec rm -rf {} +
-          echo "After strip:"
-          ls node_modules/node-pty/prebuilds
+          set -e
+          mkdir -p "$HOME/clangwrap"
+          cat > "$HOME/clangwrap/cc" <<EOF
+          #!/bin/bash
+          exec clang -arch ${{ matrix.clang_arch }} "\$@"
+          EOF
+          cat > "$HOME/clangwrap/cxx" <<EOF
+          #!/bin/bash
+          exec clang++ -arch ${{ matrix.clang_arch }} "\$@"
+          EOF
+          chmod +x "$HOME/clangwrap/cc" "$HOME/clangwrap/cxx"
+          echo "CC=$HOME/clangwrap/cc" >> "$GITHUB_ENV"
+          echo "CXX=$HOME/clangwrap/cxx" >> "$GITHUB_ENV"
+          # Build for macOS 11.0+ (Big Sur — Intel Mac baseline for current
+          # Apple Silicon era; arm64 was introduced here too).
+          echo "MACOSX_DEPLOYMENT_TARGET=11.0" >> "$GITHUB_ENV"
+
+      - name: Rebuild node-pty for ${{ matrix.target }}
+        env:
+          npm_config_arch: ${{ matrix.npm_arch }}
+          npm_config_target_arch: ${{ matrix.npm_arch }}
+          npm_config_target_platform: darwin
+        run: |
+          set -e
+          rm -rf node_modules/node-pty/prebuilds
+          npm rebuild node-pty
+          file node_modules/node-pty/build/Release/pty.node || true
+          # Clean build intermediates so the VSIX only carries the loadable
+          # artifact, not Makefiles / .o files / etc.
+          mv node_modules/node-pty/build/Release/pty.node /tmp/pty.node
+          rm -rf node_modules/node-pty/build
+          mkdir -p node_modules/node-pty/build/Release
+          mv /tmp/pty.node node_modules/node-pty/build/Release/
 
       - name: Package extension
-        run: npx --yes @vscode/vsce@latest package --target darwin-arm64 --out dterm-darwin-arm64.vsix
+        run: npx --yes @vscode/vsce@latest package --target ${{ matrix.target }} --out dterm-${{ matrix.target }}.vsix
 
       - uses: actions/upload-artifact@v4
         with:
-          name: dterm-darwin-arm64
-          path: dterm-darwin-arm64.vsix
+          name: dterm-${{ matrix.target }}
+          path: dterm-${{ matrix.target }}.vsix
           if-no-files-found: error
 
   release:
