@@ -1,0 +1,120 @@
+{
+  "name": "dterm",
+  "displayName": "dterm",
+  "description": "Persistent terminal sessions per workspace with auto-reattach. Self-contained — no external daemon required.",
+  "version": "0.2.4",
+  "publisher": "local",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "extensionKind": [
+    "workspace"
+  ],
+  "main": "./out/extension.js",
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "contributes": {
+    "terminal": {
+      "profiles": [
+        {
+          "id": "dterm.profile",
+          "title": "dterm",
+          "icon": "terminal-linux"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "dterm.reconnect",
+        "title": "dterm: Reattach all workspace sessions"
+      },
+      {
+        "command": "dterm.killSession",
+        "title": "dterm: Kill the active terminal's session"
+      },
+      {
+        "command": "dterm.forgetSession",
+        "title": "dterm: Forget the active terminal's session (leaves it running)"
+      },
+      {
+        "command": "dterm.listSessions",
+        "title": "dterm: List sessions"
+      },
+      {
+        "command": "dterm.showDaemonLog",
+        "title": "dterm: Show daemon log"
+      },
+      {
+        "command": "dterm.showDiagnostics",
+        "title": "dterm: Show diagnostics"
+      },
+      {
+        "command": "dterm.restartDaemon",
+        "title": "dterm: Restart daemon (kills all sessions)"
+      },
+      {
+        "command": "dterm.pushDaemonSettings",
+        "title": "dterm: Push current settings to daemon"
+      },
+      {
+        "command": "dterm.installClaudeWrapper",
+        "title": "dterm: Install as Claude Code process wrapper"
+      },
+      {
+        "command": "dterm.uninstallClaudeWrapper",
+        "title": "dterm: Uninstall as Claude Code process wrapper"
+      }
+    ],
+    "configuration": {
+      "title": "dterm",
+      "properties": {
+        "dterm.autoReconnect": {
+          "type": "boolean",
+          "default": true,
+          "description": "On workspace open, recreate VS Code terminals for each persisted session that is still alive."
+        },
+        "dterm.scrollbackLines": {
+          "type": "number",
+          "default": 0,
+          "minimum": 0,
+          "description": "Daemon-side scrollback retention in lines, replayed on reattach. 0 follows `terminal.integrated.scrollback` (recommended). A positive value overrides; values greater than `terminal.integrated.scrollback` will be silently truncated by xterm.js on attach."
+        },
+        "dterm.shell": {
+          "type": "string",
+          "default": "",
+          "description": "Override the shell executable used for new sessions. Empty = $SHELL or /bin/bash."
+        },
+        "dterm.shellArgs": {
+          "type": "array",
+          "items": { "type": "string" },
+          "default": [],
+          "description": "Arguments passed to the shell on new sessions."
+        },
+        "dterm.verboseStdioLog": {
+          "type": "boolean",
+          "default": false,
+          "description": "Log every line of stdio passing through the daemon to claude (both directions). Verbose; useful for protocol debugging. Lines are truncated to 800 bytes."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p . && mv -f out/wrapper.js out/dterm-wrapper && chmod +x out/dterm-wrapper",
+    "watch": "tsc -p . -w",
+    "clean-staged-prebuild": "rm -rf node_modules/node-pty/prebuilds/linux-x64 node_modules/node-pty/prebuilds/linux-arm64",
+    "vscode:prepublish": "npm run compile && npm run clean-staged-prebuild"
+  },
+  "dependencies": {
+    "node-pty": "^1.1.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "@types/vscode": "^1.90.0",
+    "typescript": "^5.4.5"
+  }
+}

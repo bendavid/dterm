@@ -1,0 +1,39 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Run Extension",
+      "type": "extensionHost",
+      "request": "launch",
+      "args": ["--extensionDevelopmentPath=${workspaceFolder}"],
+      "outFiles": ["${workspaceFolder}/out/**/*.js"],
+      "preLaunchTask": "${defaultBuildTask}"
+    },
+    {
+      "name": "Run Extension on Remote (SSH)",
+      "type": "extensionHost",
+      "request": "launch",
+      "args": [
+        "--extensionDevelopmentPath=${workspaceFolder}",
+        "--remote=ssh-remote+${input:remoteHost}",
+        "${input:remoteFolder}"
+      ],
+      "outFiles": ["${workspaceFolder}/out/**/*.js"],
+      "preLaunchTask": "${defaultBuildTask}"
+    }
+  ],
+  "inputs": [
+    {
+      "id": "remoteHost",
+      "type": "promptString",
+      "description": "SSH host alias (e.g. 'myserver') matching an entry in your ~/.ssh/config",
+      "default": ""
+    },
+    {
+      "id": "remoteFolder",
+      "type": "promptString",
+      "description": "Absolute folder path on the remote to open (e.g. /home/user/project)",
+      "default": ""
+    }
+  ]
+}
