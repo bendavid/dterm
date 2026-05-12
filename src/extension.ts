@@ -18,6 +18,7 @@ let activeCtx: vscode.ExtensionContext | undefined;
 let logChannel: vscode.OutputChannel | undefined;
 let pollTimer: NodeJS.Timeout | undefined;
 const pendingWrites = new Set<Promise<unknown>>();
+const pendingFocus = new Set<string>();
 
 function log(line: string): void {
     if (logChannel) logChannel.appendLine(`[${new Date().toISOString()}] ${line}`);
@@ -436,10 +437,12 @@ export function activate(ctx: vscode.ExtensionContext): void {
                 if (!name) {
                     const fallback = `vscode-noworkspace-${process.pid}-${Date.now()}`;
                     log(`profile: allocating fallback session ${fallback}`);
+                    pendingFocus.add(fallback);
                     return new vscode.TerminalProfile(buildOptions(fallback, cwd));
                 }
                 log(`profile: allocated session ${name}`);
                 void rememberSession(ctx, name);
+                pendingFocus.add(name);
                 return new vscode.TerminalProfile(buildOptions(name, cwd));
             },
         }),
@@ -447,7 +450,15 @@ export function activate(ctx: vscode.ExtensionContext): void {
 
     ctx.subscriptions.push(
         vscode.window.onDidChangeActiveTerminal(() => snapshotLabels(ctx)),
-        vscode.window.onDidOpenTerminal(() => { snapshotLabels(ctx); ensurePolling(ctx); }),
+        vscode.window.onDidOpenTerminal(t => {
+            const name = sessionNameOf(t);
+            if (name && pendingFocus.has(name)) {
+                pendingFocus.delete(name);
+                t.show();
+            }
+            snapshotLabels(ctx);
+            ensurePolling(ctx);
+        }),
         vscode.window.onDidChangeTerminalState(() => snapshotLabels(ctx)),
     );
 
