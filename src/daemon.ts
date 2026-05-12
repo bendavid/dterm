@@ -7,6 +7,8 @@ import { LineStream, encode } from './protocol';
 import type { ClientMessage, DaemonMessage } from './protocol';
 
 import type * as ptyTypes from 'node-pty';
+import { Terminal } from '@xterm/headless';
+import { SerializeAddon } from '@xterm/addon-serialize';
 
 process.on('uncaughtException', e => {
     console.error('uncaughtException:', e?.stack ?? e);
@@ -45,13 +47,6 @@ try {
 
 const IDLE_EXIT_MS = 30_000;
 const DEFAULT_SCROLLBACK_LINES = 1000;
-const REASONABLE_BYTES_PER_LINE = 1024;
-const BYTE_SAFETY_FACTOR = 8;
-const MIN_BUFFER_BYTES = 1 * 1024 * 1024;
-
-function byteCeilingFor(linesCap: number): number {
-    return Math.max(MIN_BUFFER_BYTES, linesCap * REASONABLE_BYTES_PER_LINE * BYTE_SAFETY_FACTOR);
-}
 
 const DAEMON_VERSION: string = (() => {
     try {
@@ -66,9 +61,8 @@ interface Session {
     name: string;
     pty: ptyTypes.IPty;
     pid: number;
-    buffer: Buffer[];
-    bufferBytes: number;
-    lineCount: number;
+    emulator: Terminal;
+    serializeAddon: SerializeAddon;
     linesCap: number;
     cols: number;
     rows: number;
@@ -124,58 +118,12 @@ function send(client: Client, msg: DaemonMessage) {
     client.socket.write(encode(msg));
 }
 
-function countNewlines(buf: Buffer): number {
-    let count = 0;
-    let idx = 0;
-    while ((idx = buf.indexOf(0x0a, idx)) !== -1) {
-        count++;
-        idx++;
-    }
-    return count;
-}
-
-function appendBuffer(session: Session, data: Buffer) {
-    session.buffer.push(data);
-    session.bufferBytes += data.length;
-    session.lineCount += countNewlines(data);
-    evictBuffer(session);
-}
-
-function evictBuffer(session: Session): void {
-    const byteCap = byteCeilingFor(session.linesCap);
-    while (
-        (session.lineCount > session.linesCap || session.bufferBytes > byteCap) &&
-        session.buffer.length > 0
-    ) {
-        const first = session.buffer[0];
-        const nl = first.indexOf(0x0a);
-        if (nl >= 0) {
-            const drop = nl + 1;
-            session.lineCount -= 1;
-            session.bufferBytes -= drop;
-            if (drop === first.length) {
-                session.buffer.shift();
-            } else {
-                session.buffer[0] = first.subarray(drop);
-            }
-        } else if (session.buffer.length > 1) {
-            session.bufferBytes -= first.length;
-            session.buffer.shift();
-        } else if (session.bufferBytes > byteCap) {
-            const overhead = session.bufferBytes - byteCap;
-            session.buffer[0] = first.subarray(overhead);
-            session.bufferBytes -= overhead;
-            break;
-        } else {
-            break;
-        }
-    }
-}
-
-function snapshotBuffer(session: Session): Buffer {
-    return session.buffer.length === 0
-        ? Buffer.alloc(0)
-        : Buffer.concat(session.buffer, session.bufferBytes);
+function snapshotEmulatorState(session: Session): Buffer {
+    const serialized = session.serializeAddon.serialize({
+        scrollback: session.linesCap,
+        excludeAltBuffer: true,
+    });
+    return Buffer.from(serialized, 'utf8');
 }
 
 function readForegroundProcessName(pid: number): string | undefined {
@@ -236,13 +184,21 @@ function createSession(
         env: env as { [k: string]: string },
     });
 
+    const emulator = new Terminal({
+        cols: Math.max(1, cols),
+        rows: Math.max(1, rows),
+        scrollback: scrollbackLinesCap,
+        allowProposedApi: true,
+    });
+    const serializeAddon = new SerializeAddon();
+    emulator.loadAddon(serializeAddon as unknown as Parameters<Terminal['loadAddon']>[0]);
+
     const session: Session = {
         name,
         pty: ptyProc,
         pid: ptyProc.pid,
-        buffer: [],
-        bufferBytes: 0,
-        lineCount: 0,
+        emulator,
+        serializeAddon,
         linesCap: scrollbackLinesCap,
         cols,
         rows,
@@ -254,8 +210,8 @@ function createSession(
     session.processPoller.unref?.();
 
     ptyProc.onData(data => {
+        session.emulator.write(data);
         const buf = Buffer.from(data, 'utf8');
-        appendBuffer(session, buf);
         const msg: DaemonMessage = { type: 'output', data: buf.toString('base64') };
         for (const c of session.clients) send(c, msg);
     });
@@ -273,6 +229,7 @@ function createSession(
         }
         session.clients.clear();
         sessions.delete(name);
+        try { session.emulator.dispose(); } catch { /* ignore */ }
         scheduleIdleExit();
     });
 
@@ -653,6 +610,7 @@ function handleMessage(client: Client, msg: ClientMessage) {
                 if (msg.cols !== session.cols || msg.rows !== session.rows) {
                     try {
                         session.pty.resize(Math.max(1, msg.cols), Math.max(1, msg.rows));
+                        session.emulator.resize(Math.max(1, msg.cols), Math.max(1, msg.rows));
                         session.cols = msg.cols;
                         session.rows = msg.rows;
                     } catch (e) {
@@ -667,7 +625,7 @@ function handleMessage(client: Client, msg: ClientMessage) {
             session.clients.add(client);
             send(client, { type: 'opened', name: msg.name, cols: session.cols, rows: session.rows, created });
             if (!created) {
-                const snap = snapshotBuffer(session);
+                const snap = snapshotEmulatorState(session);
                 if (snap.length > 0) {
                     send(client, { type: 'output', data: snap.toString('base64') });
                 }
@@ -692,6 +650,7 @@ function handleMessage(client: Client, msg: ClientMessage) {
             if (!client.session || client.session.exited) return;
             try {
                 client.session.pty.resize(Math.max(1, msg.cols), Math.max(1, msg.rows));
+                client.session.emulator.resize(Math.max(1, msg.cols), Math.max(1, msg.rows));
                 client.session.cols = msg.cols;
                 client.session.rows = msg.rows;
             } catch (e) {
@@ -772,7 +731,7 @@ function handleMessage(client: Client, msg: ClientMessage) {
             scrollbackLinesCap = n;
             for (const s of sessions.values()) {
                 s.linesCap = n;
-                evictBuffer(s);
+                try { s.emulator.options.scrollback = n; } catch (e) { log('scrollback resize failed', s.name, e); }
             }
             return;
         }
