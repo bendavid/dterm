@@ -7,20 +7,96 @@ on:
   pull_request:
   workflow_dispatch:
 
+env:
+  ZIG_VERSION: '0.13.0'
+  GLIBC_BASELINE: '2.17'
+
 jobs:
-  package:
+  linux:
     name: Package (${{ matrix.target }})
     strategy:
       fail-fast: false
       matrix:
         include:
           - target: linux-x64
-            runs-on: ubuntu-24.04
+            zig_target: x86_64-linux-gnu.2.17
+            node_arch: x64
           - target: linux-arm64
-            runs-on: ubuntu-24.04-arm
-          - target: darwin-arm64
-            runs-on: macos-14
-    runs-on: ${{ matrix.runs-on }}
+            zig_target: aarch64-linux-gnu.2.17
+            node_arch: arm64
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install zig
+        run: |
+          set -e
+          curl -fsSL "https://ziglang.org/download/${ZIG_VERSION}/zig-linux-x86_64-${ZIG_VERSION}.tar.xz" -o /tmp/zig.tar.xz
+          mkdir -p "$HOME/zig"
+          tar -xJf /tmp/zig.tar.xz -C "$HOME/zig" --strip-components=1
+          "$HOME/zig/zig" version
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Configure zig cc as the cross-compiler
+        run: |
+          set -e
+          mkdir -p "$HOME/zigcc"
+          cat > "$HOME/zigcc/cc" <<EOF
+          #!/bin/bash
+          exec "$HOME/zig/zig" cc -target ${{ matrix.zig_target }} "\$@"
+          EOF
+          cat > "$HOME/zigcc/cxx" <<EOF
+          #!/bin/bash
+          exec "$HOME/zig/zig" c++ -target ${{ matrix.zig_target }} "\$@"
+          EOF
+          chmod +x "$HOME/zigcc/cc" "$HOME/zigcc/cxx"
+          echo "CC=$HOME/zigcc/cc" >> "$GITHUB_ENV"
+          echo "CXX=$HOME/zigcc/cxx" >> "$GITHUB_ENV"
+
+      - name: Rebuild node-pty (cross-compile against glibc ${{ env.GLIBC_BASELINE }})
+        env:
+          npm_config_arch: ${{ matrix.node_arch }}
+          npm_config_target_arch: ${{ matrix.node_arch }}
+          npm_config_target_platform: linux
+        run: |
+          set -e
+          # Wipe vendor prebuilds so node-gyp-build falls through to a source
+          # compile using zig cc as configured above.
+          rm -rf node_modules/node-pty/prebuilds
+          npm rebuild node-pty
+          # Diagnostics — sanity-check the produced binary's arch and max
+          # glibc requirement. Cross-arch objdump may not work on every
+          # binutils install, so the inspection commands are best-effort.
+          file node_modules/node-pty/build/Release/pty.node || true
+          echo "Max GLIBC required:"
+          objdump -T node_modules/node-pty/build/Release/pty.node 2>/dev/null \
+            | grep -oE 'GLIBC_[0-9.]+' | sort -uV | tail -3 || true
+          # Clean build intermediates so the VSIX only carries the loadable
+          # artifact, not Makefiles / .o files / etc.
+          mv node_modules/node-pty/build/Release/pty.node /tmp/pty.node
+          rm -rf node_modules/node-pty/build
+          mkdir -p node_modules/node-pty/build/Release
+          mv /tmp/pty.node node_modules/node-pty/build/Release/
+
+      - name: Package extension
+        run: npx --yes @vscode/vsce@latest package --target ${{ matrix.target }} --out dterm-${{ matrix.target }}.vsix
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dterm-${{ matrix.target }}
+          path: dterm-${{ matrix.target }}.vsix
+          if-no-files-found: error
+
+  darwin:
+    name: Package (darwin-arm64)
+    runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
 
@@ -37,23 +113,23 @@ jobs:
         run: |
           ls node_modules/node-pty/prebuilds
           find node_modules/node-pty/prebuilds -mindepth 1 -maxdepth 1 -type d \
-            ! -name '${{ matrix.target }}' -exec rm -rf {} +
+            ! -name 'darwin-arm64' -exec rm -rf {} +
           echo "After strip:"
           ls node_modules/node-pty/prebuilds
 
       - name: Package extension
-        run: npx --yes @vscode/vsce@latest package --target ${{ matrix.target }} --out dterm-${{ matrix.target }}.vsix
+        run: npx --yes @vscode/vsce@latest package --target darwin-arm64 --out dterm-darwin-arm64.vsix
 
       - uses: actions/upload-artifact@v4
         with:
-          name: dterm-${{ matrix.target }}
-          path: dterm-${{ matrix.target }}.vsix
+          name: dterm-darwin-arm64
+          path: dterm-darwin-arm64.vsix
           if-no-files-found: error
 
   release:
     name: Release
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: package
+    needs: [linux, darwin]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
