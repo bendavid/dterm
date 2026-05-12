@@ -5,6 +5,10 @@
   "version": "0.2.4",
   "publisher": "local",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/bendavid/dterm.git"
+  },
   "engines": {
     "vscode": "^1.90.0"
   },
