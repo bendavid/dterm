@@ -315,7 +315,14 @@ async function reconnectAll(
     const cwd = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
     for (const name of ours) {
         if (alreadyOpen.has(name)) {
-            log(`reconnectAll: already open: ${name}`);
+            const t = vscode.window.terminals.find(t => sessionNameOf(t) === name);
+            const pty = t ? ptyOf(t) : undefined;
+            if (pty?.ready) {
+                log(`reconnectAll: resync already-open ${name}`);
+                pty.resync();
+            } else {
+                log(`reconnectAll: already open but not ready: ${name}`);
+            }
             continue;
         }
         log(`reconnectAll: creating terminal for ${name}`);
@@ -504,6 +511,27 @@ export function activate(ctx: vscode.ExtensionContext): void {
         vscode.commands.registerCommand('dterm.reconnect', () =>
             reconnectAll(ctx, { interactive: true }),
         ),
+    );
+
+    ctx.subscriptions.push(
+        vscode.commands.registerCommand('dterm.resyncActive', () => {
+            const t = vscode.window.activeTerminal;
+            if (!t) {
+                vscode.window.showInformationMessage('dterm: no active terminal.');
+                return;
+            }
+            const pty = ptyOf(t);
+            if (!pty) {
+                vscode.window.showInformationMessage('dterm: active terminal is not a dterm session.');
+                return;
+            }
+            if (!pty.ready) {
+                vscode.window.showInformationMessage('dterm: session is still connecting.');
+                return;
+            }
+            log(`resyncActive: ${pty.sessionName}`);
+            pty.resync();
+        }),
     );
 
     ctx.subscriptions.push(

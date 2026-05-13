@@ -2,7 +2,7 @@
   "name": "dterm",
   "displayName": "dterm",
   "description": "Persistent terminal sessions per workspace with auto-reattach. Self-contained — no external daemon required.",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "publisher": "local",
   "license": "MIT",
   "repository": {
@@ -36,6 +36,10 @@
       {
         "command": "dterm.reconnect",
         "title": "dterm: Reattach all workspace sessions"
+      },
+      {
+        "command": "dterm.resyncActive",
+        "title": "dterm: Resync active terminal"
       },
       {
         "command": "dterm.killSession",

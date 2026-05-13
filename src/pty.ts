@@ -117,6 +117,22 @@ export class DtermPseudoterminal implements vscode.Pseudoterminal {
         this.writeEmitter.fire('\x1b[33mPress any key to close this terminal.\x1b[0m\r\n');
     }
 
+    resync(): void {
+        if (!this.opened || this.failed) return;
+        this.opts.log?.(`pty ${this.sessionName}: resync (cols=${this.cols}, rows=${this.rows})`);
+        this.conn.send({ type: 'detach' });
+        this.conn.send({
+            type: 'open',
+            name: this.opts.sessionName,
+            cols: this.cols,
+            rows: this.rows,
+            cwd: this.opts.cwd,
+            env: this.opts.env,
+            shell: this.opts.shell || undefined,
+            shellArgs: this.opts.shellArgs,
+        });
+    }
+
     setDimensions(dim: vscode.TerminalDimensions): void {
         this.cols = dim.columns;
         this.rows = dim.rows;
