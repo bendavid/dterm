@@ -9,54 +9,37 @@ import { oneShot, readDaemonLogTail, isDaemonAlive } from './client';
 import { daemonLogPath, socketPath } from './paths';
 
 const PROFILE_ID = 'dterm.profile';
-const KEY_SESSIONS = 'dterm.sessions';
-const KEY_NEXT_INDEX = 'dterm.nextIndex';
-const KEY_WORKSPACE_TAG = 'dterm.workspaceTag';
-const KEY_LABELS = 'dterm.labels';
 
 let activeCtx: vscode.ExtensionContext | undefined;
 let logChannel: vscode.OutputChannel | undefined;
 let pollTimer: NodeJS.Timeout | undefined;
-const pendingWrites = new Set<Promise<unknown>>();
+const pendingPushes = new Set<Promise<unknown>>();
 const pendingFocus = new Set<string>();
+// Tracks the last label value we pushed to the daemon for each session, so
+// snapshotLabels doesn't re-send the same value on every tick.
+const pushedLabels = new Map<string, string | undefined>();
 
 function log(line: string): void {
     if (logChannel) logChannel.appendLine(`[${new Date().toISOString()}] ${line}`);
-}
-
-function updateState<T>(
-    ctx: vscode.ExtensionContext,
-    key: string,
-    value: T,
-): Promise<void> {
-    const p = Promise.resolve(ctx.workspaceState.update(key, value));
-    pendingWrites.add(p);
-    p.finally(() => pendingWrites.delete(p));
-    return p.then(() => undefined);
 }
 
 function defaultLabelFor(sessionName: string): string {
     return `dterm: ${sessionName}`;
 }
 
-function getLabels(ctx: vscode.ExtensionContext): Record<string, string> {
-    return ctx.workspaceState.get<Record<string, string>>(KEY_LABELS, {});
-}
-
-async function setLabel(
-    ctx: vscode.ExtensionContext,
-    sessionName: string,
-    label: string | undefined,
-): Promise<void> {
-    const labels = { ...getLabels(ctx) };
-    if (label === undefined || label === defaultLabelFor(sessionName)) {
-        if (labels[sessionName] === undefined) return;
-        delete labels[sessionName];
-    } else {
-        if (labels[sessionName] === label) return;
-        labels[sessionName] = label;
-    }
-    await updateState(ctx, KEY_LABELS, labels);
+async function pushLabel(name: string, label: string | undefined): Promise<void> {
+    if (pushedLabels.get(name) === label) return;
+    pushedLabels.set(name, label);
+    log(`pushLabel ${name} -> ${label === undefined ? '(clear)' : `"${label}"`}`);
+    const p = oneShot(
+        daemonScriptPath(),
+        { type: 'set_label', name, label },
+        () => true,
+        500,
+    );
+    pendingPushes.add(p);
+    p.finally(() => pendingPushes.delete(p));
+    await p;
 }
 
 function ptyOf(t: vscode.Terminal): DtermPseudoterminal | undefined {
@@ -64,9 +47,7 @@ function ptyOf(t: vscode.Terminal): DtermPseudoterminal | undefined {
     return co.pty instanceof DtermPseudoterminal ? co.pty : undefined;
 }
 
-function snapshotLabels(ctx: vscode.ExtensionContext): void {
-    const labels = getLabels(ctx);
-    let next: Record<string, string> | undefined;
+function snapshotLabels(): void {
     for (const t of vscode.window.terminals) {
         const sName = sessionNameOf(t);
         if (!sName) continue;
@@ -78,23 +59,15 @@ function snapshotLabels(ctx: vscode.ExtensionContext): void {
 
         if (pty) pty.suppressTitleUpdates = isUserOverride;
 
-        const stored = labels[sName];
-        if (isUserOverride) {
-            if (stored !== current) {
-                next = next ?? { ...labels };
-                next[sName] = current;
-                log(`snapshot: ${sName} label="${current}" (was ${stored === undefined ? 'unset' : `"${stored}"`})`);
-            }
-        } else if (stored !== undefined) {
-            next = next ?? { ...labels };
-            delete next[sName];
-            log(`snapshot: ${sName} cleared (was "${stored}", current="${current}", default=${isDefault}, osc=${isOscFired})`);
+        const target = isUserOverride ? current : undefined;
+        if (pushedLabels.get(sName) !== target) {
+            log(`snapshot: ${sName} -> ${target === undefined ? '(clear)' : `"${target}"`} (current="${current}", default=${isDefault}, osc=${isOscFired})`);
+            void pushLabel(sName, target);
         }
     }
-    if (next) void updateState(ctx, KEY_LABELS, next);
 }
 
-function ensurePolling(ctx: vscode.ExtensionContext): void {
+function ensurePolling(): void {
     if (pollTimer) return;
     pollTimer = setInterval(() => {
         const hasAny = vscode.window.terminals.some(t => sessionNameOf(t) !== undefined);
@@ -103,15 +76,12 @@ function ensurePolling(ctx: vscode.ExtensionContext): void {
             pollTimer = undefined;
             return;
         }
-        snapshotLabels(ctx);
+        snapshotLabels();
     }, 2000);
     pollTimer.unref?.();
 }
 
-function workspaceTag(ctx: vscode.ExtensionContext): string | undefined {
-    const cached = ctx.workspaceState.get<string>(KEY_WORKSPACE_TAG);
-    if (cached) return cached;
-
+function workspaceTag(): string | undefined {
     const wsFile = vscode.workspace.workspaceFile?.fsPath;
     const folders = vscode.workspace.workspaceFolders;
     let basis: string;
@@ -127,37 +97,41 @@ function workspaceTag(ctx: vscode.ExtensionContext): string | undefined {
     }
     const hash = crypto.createHash('sha1').update(basis).digest('hex').slice(0, 8);
     const safe = label.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 24) || 'workspace';
-    const tag = `${safe}-${hash}`;
-    void updateState(ctx, KEY_WORKSPACE_TAG, tag);
-    return tag;
+    return `${safe}-${hash}`;
 }
 
-function allocateSessionName(ctx: vscode.ExtensionContext): string | undefined {
-    const tag = workspaceTag(ctx);
+interface DaemonSessions {
+    names: string[];
+    labels: Record<string, string>;
+}
+
+async function fetchDaemonSessions(): Promise<DaemonSessions | undefined> {
+    const resp = await oneShot(
+        daemonScriptPath(),
+        { type: 'list' },
+        m => m.type === 'list_response',
+    );
+    if (!resp || resp.type !== 'list_response') return undefined;
+    return { names: resp.names, labels: resp.labels ?? {} };
+}
+
+async function allocateSessionName(): Promise<string | undefined> {
+    const tag = workspaceTag();
     if (!tag) return undefined;
-    const used = new Set(ctx.workspaceState.get<string[]>(KEY_SESSIONS, []));
-    let n = ctx.workspaceState.get<number>(KEY_NEXT_INDEX, 1);
-    let name = `vscode-${tag}-${n}`;
-    while (used.has(name)) {
-        n += 1;
-        name = `vscode-${tag}-${n}`;
+    const prefix = `vscode-${tag}-`;
+    const live = await fetchDaemonSessions();
+    const used = new Set<string>(live?.names ?? []);
+    for (const t of vscode.window.terminals) {
+        const n = sessionNameOf(t);
+        if (n) used.add(n);
     }
-    void updateState(ctx, KEY_NEXT_INDEX, n + 1);
-    return name;
-}
-
-function rememberSession(ctx: vscode.ExtensionContext, name: string): Promise<void> {
-    const sessions = ctx.workspaceState.get<string[]>(KEY_SESSIONS, []);
-    if (sessions.includes(name)) return Promise.resolve();
-    return updateState(ctx, KEY_SESSIONS, [...sessions, name]);
-}
-
-async function forgetSession(ctx: vscode.ExtensionContext, name: string): Promise<void> {
-    const sessions = ctx.workspaceState.get<string[]>(KEY_SESSIONS, []);
-    if (sessions.includes(name)) {
-        await updateState(ctx, KEY_SESSIONS, sessions.filter(s => s !== name));
+    let n = 1;
+    for (const name of used) {
+        if (!name.startsWith(prefix)) continue;
+        const idx = parseInt(name.slice(prefix.length), 10);
+        if (Number.isFinite(idx) && idx >= n) n = idx + 1;
     }
-    await setLabel(ctx, name, undefined);
+    return `${prefix}${n}`;
 }
 
 function daemonScriptPath(): string {
@@ -298,46 +272,54 @@ async function checkDaemonVersion(ctx: vscode.ExtensionContext): Promise<{ resta
 }
 
 async function reconnectAll(
-    ctx: vscode.ExtensionContext,
+    _ctx: vscode.ExtensionContext,
     opts?: { interactive?: boolean },
 ): Promise<void> {
-    const persisted = ctx.workspaceState.get<string[]>(KEY_SESSIONS, []);
-    log(`reconnectAll: persisted=${JSON.stringify(persisted)}`);
-    if (persisted.length === 0) return;
-
-    const live = await listLiveSessions();
-    log(`reconnectAll: live=${live === undefined ? 'undefined (daemon unreachable)' : JSON.stringify(live)}`);
-    if (live === undefined) {
-        const msg = `dterm: ${persisted.length} session(s) persisted, but daemon is unreachable. Check "dterm: Show daemon log".`;
+    const tag = workspaceTag();
+    if (!tag) {
         if (opts?.interactive) {
-            vscode.window.showErrorMessage(msg);
-        } else {
-            vscode.window.showWarningMessage(msg);
+            vscode.window.showInformationMessage(
+                'dterm: no workspace folders open — nothing to reattach.',
+            );
         }
         return;
     }
-    const liveSet = new Set(live);
-    const stillThere = persisted.filter(n => liveSet.has(n));
-    const dropped = persisted.filter(n => !liveSet.has(n));
-    if (dropped.length > 0) {
-        log(`reconnectAll: dropping dead sessions ${JSON.stringify(dropped)}`);
+    const prefix = `vscode-${tag}-`;
+    const live = await fetchDaemonSessions();
+    log(`reconnectAll: live=${live === undefined ? 'undefined (daemon unreachable)' : JSON.stringify(live.names)}`);
+    if (live === undefined) {
+        if (opts?.interactive) {
+            vscode.window.showErrorMessage(
+                'dterm: daemon unreachable. Check "dterm: Show daemon log".',
+            );
+        }
+        return;
     }
-    if (stillThere.length !== persisted.length) {
-        await updateState(ctx, KEY_SESSIONS, stillThere);
+    const ours = live.names.filter(n => n.startsWith(prefix));
+    if (ours.length === 0) {
+        if (opts?.interactive) {
+            vscode.window.showInformationMessage(
+                'dterm: no live sessions for this workspace.',
+            );
+        }
+        return;
     }
-
+    // Prime label cache with the daemon's current value so snapshotLabels
+    // doesn't immediately re-push the same value.
+    for (const n of ours) {
+        pushedLabels.set(n, live.labels[n]);
+    }
     const alreadyOpen = new Set(
         vscode.window.terminals.map(sessionNameOf).filter((n): n is string => Boolean(n)),
     );
     const cwd = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
-    const labels = getLabels(ctx);
-    for (const name of stillThere) {
+    for (const name of ours) {
         if (alreadyOpen.has(name)) {
             log(`reconnectAll: already open: ${name}`);
             continue;
         }
         log(`reconnectAll: creating terminal for ${name}`);
-        vscode.window.createTerminal(buildOptions(name, cwd, labels[name]));
+        vscode.window.createTerminal(buildOptions(name, cwd, live.labels[name]));
     }
 }
 
@@ -431,9 +413,9 @@ export function activate(ctx: vscode.ExtensionContext): void {
 
     ctx.subscriptions.push(
         vscode.window.registerTerminalProfileProvider(PROFILE_ID, {
-            provideTerminalProfile() {
-                const name = allocateSessionName(ctx);
+            async provideTerminalProfile() {
                 const cwd = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+                const name = await allocateSessionName();
                 if (!name) {
                     const fallback = `vscode-noworkspace-${process.pid}-${Date.now()}`;
                     log(`profile: allocating fallback session ${fallback}`);
@@ -441,7 +423,6 @@ export function activate(ctx: vscode.ExtensionContext): void {
                     return new vscode.TerminalProfile(buildOptions(fallback, cwd));
                 }
                 log(`profile: allocated session ${name}`);
-                void rememberSession(ctx, name);
                 pendingFocus.add(name);
                 return new vscode.TerminalProfile(buildOptions(name, cwd));
             },
@@ -449,7 +430,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
     );
 
     ctx.subscriptions.push(
-        vscode.window.onDidChangeActiveTerminal(() => snapshotLabels(ctx)),
+        vscode.window.onDidChangeActiveTerminal(() => snapshotLabels()),
         vscode.window.onDidOpenTerminal(t => {
             const name = sessionNameOf(t);
             if (name && pendingFocus.has(name)) {
@@ -471,10 +452,10 @@ export function activate(ctx: vscode.ExtensionContext): void {
                     t.show();
                 }
             }
-            snapshotLabels(ctx);
-            ensurePolling(ctx);
+            snapshotLabels();
+            ensurePolling();
         }),
-        vscode.window.onDidChangeTerminalState(() => snapshotLabels(ctx)),
+        vscode.window.onDidChangeTerminalState(() => snapshotLabels()),
     );
 
     ctx.subscriptions.push(
@@ -496,7 +477,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
     void pushAllDaemonSettings();
 
     if (vscode.window.terminals.some(t => sessionNameOf(t) !== undefined)) {
-        ensurePolling(ctx);
+        ensurePolling();
     }
 
     ctx.subscriptions.push(
@@ -507,19 +488,15 @@ export function activate(ctx: vscode.ExtensionContext): void {
             log(`close: ${name} reason=${reason} t.name="${t.name}"`);
             if (reason === vscode.TerminalExitReason.User) {
                 await daemonKill(name);
-                await forgetSession(ctx, name);
+                pushedLabels.delete(name);
                 return;
             }
             const pty = ptyOf(t);
             const isOscFired = pty?.lastFiredTitle !== undefined && t.name === pty.lastFiredTitle;
             const isDefault = t.name === defaultLabelFor(name);
-            if (!isOscFired && !isDefault) {
-                log(`close: persisting label "${t.name}" for ${name}`);
-                await setLabel(ctx, name, t.name);
-            } else {
-                log(`close: clearing label for ${name} (default=${isDefault}, oscFired=${isOscFired}, lastFired="${pty?.lastFiredTitle ?? ''}")`);
-                await setLabel(ctx, name, undefined);
-            }
+            const target = (!isOscFired && !isDefault) ? t.name : undefined;
+            log(`close: pushing label ${target === undefined ? '(clear)' : `"${target}"`} for ${name} (default=${isDefault}, oscFired=${isOscFired}, lastFired="${pty?.lastFiredTitle ?? ''}")`);
+            await pushLabel(name, target);
         }),
     );
 
@@ -538,7 +515,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
                 return;
             }
             const ok = await daemonKill(name);
-            await forgetSession(ctx, name);
+            pushedLabels.delete(name);
             t?.dispose();
             vscode.window.showInformationMessage(
                 ok ? `dterm: killed ${name}.` : `dterm: kill request sent for ${name}.`,
@@ -546,26 +523,10 @@ export function activate(ctx: vscode.ExtensionContext): void {
         }),
     );
 
-    ctx.subscriptions.push(
-        vscode.commands.registerCommand('dterm.forgetSession', async () => {
-            const t = vscode.window.activeTerminal;
-            const name = t ? sessionNameOf(t) : undefined;
-            if (!name) {
-                vscode.window.showInformationMessage('dterm: active terminal is not a dterm session.');
-                return;
-            }
-            await forgetSession(ctx, name);
-            vscode.window.showInformationMessage(
-                `dterm: forgot ${name} (still running; use Kill to terminate).`,
-            );
-        }),
-    );
-
     logChannel = vscode.window.createOutputChannel('dterm');
     ctx.subscriptions.push(logChannel);
     log(`activate: extensionPath=${ctx.extensionPath}`);
-    log(`activate: workspaceTag=${workspaceTag(ctx) ?? '(none)'}`);
-    log(`activate: persisted KEY_SESSIONS=${JSON.stringify(ctx.workspaceState.get<string[]>(KEY_SESSIONS, []))}`);
+    log(`activate: workspaceTag=${workspaceTag() ?? '(none)'}`);
 
     ctx.subscriptions.push(
         vscode.commands.registerCommand('dterm.restartDaemon', async () => {
@@ -576,6 +537,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
                 try { fs.statSync(socketPath()); } catch { break; }
             }
             await pushAllDaemonSettings();
+            pushedLabels.clear();
             const live = await listLiveSessions();
             if (live !== undefined) {
                 vscode.window.showInformationMessage(`dterm: daemon restarted (live sessions: ${live.length}).`);
@@ -598,10 +560,8 @@ export function activate(ctx: vscode.ExtensionContext): void {
             const sock = socketPath();
             let sockExists = false;
             try { fs.statSync(sock); sockExists = true; } catch { /* not there */ }
-            const live = await listLiveSessions();
-            const persisted = ctx.workspaceState.get<string[]>(KEY_SESSIONS, []);
-            const labels = getLabels(ctx);
-            const tag = workspaceTag(ctx) ?? '(none)';
+            const live = await fetchDaemonSessions();
+            const tag = workspaceTag() ?? '(none)';
             const openTerms = vscode.window.terminals.map(t => ({
                 name: t.name,
                 session: sessionNameOf(t),
@@ -609,9 +569,8 @@ export function activate(ctx: vscode.ExtensionContext): void {
             ch.appendLine('--- dterm diagnostics ---');
             ch.appendLine(`workspaceTag: ${tag}`);
             ch.appendLine(`socket: ${sock} exists=${sockExists}`);
-            ch.appendLine(`live sessions: ${live === undefined ? '(daemon unreachable)' : JSON.stringify(live)}`);
-            ch.appendLine(`persisted sessions: ${JSON.stringify(persisted)}`);
-            ch.appendLine(`labels: ${JSON.stringify(labels)}`);
+            ch.appendLine(`live sessions: ${live === undefined ? '(daemon unreachable)' : JSON.stringify(live.names)}`);
+            ch.appendLine(`daemon labels: ${live === undefined ? '(daemon unreachable)' : JSON.stringify(live.labels)}`);
             ch.appendLine(`open terminals: ${JSON.stringify(openTerms)}`);
             ch.appendLine(`daemon log: ${daemonLogPath()}`);
             ch.appendLine('---');
@@ -702,20 +661,28 @@ export function activate(ctx: vscode.ExtensionContext): void {
 
     ctx.subscriptions.push(
         vscode.commands.registerCommand('dterm.listSessions', async () => {
-            const persisted = ctx.workspaceState.get<string[]>(KEY_SESSIONS, []);
-            const live = await listLiveSessions();
+            const live = await fetchDaemonSessions();
             if (live === undefined) {
                 vscode.window.showErrorMessage('dterm: daemon unreachable.');
                 return;
             }
-            const liveSet = new Set(live);
-            const persistedSet = new Set(persisted);
+            const tag = workspaceTag();
+            const prefix = tag ? `vscode-${tag}-` : undefined;
+            const ours: string[] = [];
+            const others: string[] = [];
+            for (const n of live.names) {
+                if (prefix && n.startsWith(prefix)) ours.push(n);
+                else others.push(n);
+            }
+            const fmt = (n: string): string => {
+                const lbl = live.labels[n];
+                return lbl ? `${n}  (${lbl})` : n;
+            };
             const lines: string[] = [];
-            for (const n of persisted) lines.push(`${liveSet.has(n) ? '●' : '○'} ${n}`);
-            const others = live.filter(n => !persistedSet.has(n));
+            for (const n of ours) lines.push(`● ${fmt(n)}`);
             if (others.length) {
                 if (lines.length) lines.push('—');
-                for (const n of others) lines.push(`· ${n}`);
+                for (const n of others) lines.push(`· ${fmt(n)}`);
             }
             vscode.window.showInformationMessage(
                 lines.length ? lines.join('\n') : 'dterm: no sessions.',
@@ -738,11 +705,9 @@ export async function deactivate(): Promise<void> {
         clearInterval(pollTimer);
         pollTimer = undefined;
     }
-    if (activeCtx) {
-        snapshotLabels(activeCtx);
-    }
-    if (pendingWrites.size > 0) {
-        await Promise.allSettled([...pendingWrites]);
+    snapshotLabels();
+    if (pendingPushes.size > 0) {
+        await Promise.allSettled([...pendingPushes]);
     }
     activeCtx = undefined;
 }

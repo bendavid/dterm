@@ -16,6 +16,7 @@ export type ClientMessage =
     | { type: 'detach' }
     | { type: 'set_scrollback_lines'; lines: number }
     | { type: 'set_verbose_stdio_log'; enabled: boolean }
+    | { type: 'set_label'; name: string; label: string | undefined }
     | { type: 'shutdown' }
     | { type: 'version' }
     | {
@@ -34,7 +35,7 @@ export type DaemonMessage =
     | { type: 'opened'; name: string; cols: number; rows: number; created: boolean }
     | { type: 'output'; data: string }
     | { type: 'process_name'; name: string }
-    | { type: 'list_response'; names: string[] }
+    | { type: 'list_response'; names: string[]; labels: Record<string, string> }
     | { type: 'killed'; name: string }
     | { type: 'session_end'; name: string; exitCode?: number; signal?: number }
     | { type: 'version_response'; version: string }
