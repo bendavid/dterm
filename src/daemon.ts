@@ -161,7 +161,11 @@ function pollProcessName(session: Session): void {
 }
 
 function buildShellEnv(extra: Record<string, string> | undefined): NodeJS.ProcessEnv {
-    const env: NodeJS.ProcessEnv = { ...process.env, ...(extra ?? {}) };
+    // When the client provides env, use it verbatim — the daemon survives across
+    // VS Code restarts so its own process.env is stale and would leak old VS Code
+    // IPC handles, ASKPASS paths, etc. into the new session. Fall back to the
+    // daemon's env only if the client didn't send one (legacy callers).
+    const env: NodeJS.ProcessEnv = extra !== undefined ? { ...extra } : { ...process.env };
     delete env.ELECTRON_RUN_AS_NODE;
     delete env.ELECTRON_NO_ATTACH_CONSOLE;
     return env;

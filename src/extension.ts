@@ -185,6 +185,14 @@ function shellConfig() {
     };
 }
 
+function currentExtensionHostEnv(): Record<string, string> {
+    const env: Record<string, string> = {};
+    for (const [k, v] of Object.entries(process.env)) {
+        if (typeof v === 'string') env[k] = v;
+    }
+    return env;
+}
+
 function buildOptions(
     sessionName: string,
     cwd?: string,
@@ -197,6 +205,7 @@ function buildOptions(
         cwd,
         shell: cfg.shell,
         shellArgs: cfg.shellArgs,
+        env: currentExtensionHostEnv(),
         scrollbackLines: cfg.scrollbackLines,
         suppressTitleUpdates: label !== undefined,
         log,

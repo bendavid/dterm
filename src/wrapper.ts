@@ -169,12 +169,17 @@ async function ensureDaemon(): Promise<void> {
     }
 
     sock.on('connect', () => {
+        const env: Record<string, string> = {};
+        for (const [k, v] of Object.entries(process.env)) {
+            if (typeof v === 'string') env[k] = v;
+        }
         const msg: ClientMessage = {
             type: 'open_process',
             name: sessionName,
             executable,
             args: procArgsWithHooks,
             cwd: process.cwd(),
+            env,
         };
         sock.write(encode(msg));
     });
