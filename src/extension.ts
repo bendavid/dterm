@@ -25,6 +25,9 @@ const pendingFocus = new Set<string>();
 // Tracks the last label value we pushed to the daemon for each session, so
 // snapshotLabels doesn't re-send the same value on every tick.
 const pushedLabels = new Map<string, string | undefined>();
+// Same idea for terminal locations (viewColumn when moved to the editor area;
+// undefined means panel).
+const pushedLocations = new Map<string, number | undefined>();
 
 function log(line: string): void {
     if (logChannel) logChannel.appendLine(`[${new Date().toISOString()}] ${line}`);
@@ -41,6 +44,21 @@ async function pushLabel(name: string, label: string | undefined): Promise<void>
     const p = oneShot(
         daemonScriptPath(),
         { type: 'set_label', name, label },
+        () => true,
+        500,
+    );
+    pendingPushes.add(p);
+    p.finally(() => pendingPushes.delete(p));
+    await p;
+}
+
+async function pushLocation(name: string, viewColumn: number | undefined): Promise<void> {
+    if (pushedLocations.get(name) === viewColumn) return;
+    pushedLocations.set(name, viewColumn);
+    log(`pushLocation ${name} -> ${viewColumn === undefined ? '(panel)' : `column ${viewColumn}`}`);
+    const p = oneShot(
+        daemonScriptPath(),
+        { type: 'set_location', name, viewColumn },
         () => true,
         500,
     );
@@ -74,6 +92,33 @@ function snapshotLabels(): void {
     }
 }
 
+function snapshotLocations(): void {
+    // Build map of session name -> viewColumn for terminals currently in the
+    // editor area. Terminals in the panel are absent from this map.
+    const inEditor = new Map<string, number>();
+    for (const group of vscode.window.tabGroups.all) {
+        for (const tab of group.tabs) {
+            if (!(tab.input instanceof vscode.TabInputTerminal)) continue;
+            for (const t of vscode.window.terminals) {
+                const sName = sessionNameOf(t);
+                if (!sName) continue;
+                if (tab.label === t.name) {
+                    inEditor.set(sName, group.viewColumn);
+                    break;
+                }
+            }
+        }
+    }
+    for (const t of vscode.window.terminals) {
+        const sName = sessionNameOf(t);
+        if (!sName) continue;
+        const target = inEditor.get(sName);
+        if (pushedLocations.get(sName) !== target) {
+            void pushLocation(sName, target);
+        }
+    }
+}
+
 function ensurePolling(): void {
     if (pollTimer) return;
     pollTimer = setInterval(() => {
@@ -84,6 +129,7 @@ function ensurePolling(): void {
             return;
         }
         snapshotLabels();
+        snapshotLocations();
     }, 2000);
     pollTimer.unref?.();
 }
@@ -110,6 +156,7 @@ function workspaceTag(): string | undefined {
 interface DaemonSessions {
     names: string[];
     labels: Record<string, string>;
+    locations: Record<string, number>;
 }
 
 async function fetchDaemonSessions(): Promise<DaemonSessions | undefined> {
@@ -119,7 +166,11 @@ async function fetchDaemonSessions(): Promise<DaemonSessions | undefined> {
         m => m.type === 'list_response',
     );
     if (!resp || resp.type !== 'list_response') return undefined;
-    return { names: resp.names, labels: resp.labels ?? {} };
+    return {
+        names: resp.names,
+        labels: resp.labels ?? {},
+        locations: resp.locations ?? {},
+    };
 }
 
 async function allocateSessionName(): Promise<string | undefined> {
@@ -270,6 +321,7 @@ function buildOptions(
     sessionName: string,
     cwd?: string,
     label?: string,
+    viewColumn?: number,
 ): vscode.ExtensionTerminalOptions {
     const cfg = shellConfig();
     const pty = new DtermPseudoterminal({
@@ -289,6 +341,7 @@ function buildOptions(
         isTransient: true,
         iconPath: new vscode.ThemeIcon('plug'),
         color: new vscode.ThemeColor('terminal.ansiCyan'),
+        location: viewColumn !== undefined ? { viewColumn } : undefined,
     };
 }
 
@@ -391,6 +444,7 @@ async function reconnectAll(
     // doesn't immediately re-push the same value.
     for (const n of ours) {
         pushedLabels.set(n, live.labels[n]);
+        pushedLocations.set(n, live.locations[n]);
     }
     const alreadyOpen = new Set(
         vscode.window.terminals.map(sessionNameOf).filter((n): n is string => Boolean(n)),
@@ -408,8 +462,8 @@ async function reconnectAll(
             }
             continue;
         }
-        log(`reconnectAll: creating terminal for ${name}`);
-        vscode.window.createTerminal(buildOptions(name, cwd, live.labels[name]));
+        log(`reconnectAll: creating terminal for ${name} (col=${live.locations[name] ?? 'panel'})`);
+        vscode.window.createTerminal(buildOptions(name, cwd, live.labels[name], live.locations[name]));
     }
 }
 
@@ -530,6 +584,8 @@ export function activate(ctx: vscode.ExtensionContext): void {
     );
 
     ctx.subscriptions.push(
+        vscode.window.tabGroups.onDidChangeTabs(() => snapshotLocations()),
+        vscode.window.tabGroups.onDidChangeTabGroups(() => snapshotLocations()),
         vscode.window.onDidChangeActiveTerminal(() => snapshotLabels()),
         vscode.window.onDidOpenTerminal(t => {
             const name = sessionNameOf(t);
@@ -589,6 +645,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
             if (reason === vscode.TerminalExitReason.User) {
                 await daemonKill(name);
                 pushedLabels.delete(name);
+                pushedLocations.delete(name);
                 return;
             }
             const pty = ptyOf(t);
@@ -637,6 +694,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
             }
             const ok = await daemonKill(name);
             pushedLabels.delete(name);
+            pushedLocations.delete(name);
             t?.dispose();
             vscode.window.showInformationMessage(
                 ok ? `dterm: killed ${name}.` : `dterm: kill request sent for ${name}.`,
@@ -660,6 +718,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
             }
             await pushAllDaemonSettings();
             pushedLabels.clear();
+            pushedLocations.clear();
             const live = await listLiveSessions();
             if (live !== undefined) {
                 vscode.window.showInformationMessage(`dterm: daemon restarted (live sessions: ${live.length}).`);
@@ -693,6 +752,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
             ch.appendLine(`socket: ${sock} exists=${sockExists}`);
             ch.appendLine(`live sessions: ${live === undefined ? '(daemon unreachable)' : JSON.stringify(live.names)}`);
             ch.appendLine(`daemon labels: ${live === undefined ? '(daemon unreachable)' : JSON.stringify(live.labels)}`);
+            ch.appendLine(`daemon locations: ${live === undefined ? '(daemon unreachable)' : JSON.stringify(live.locations)}`);
             ch.appendLine(`open terminals: ${JSON.stringify(openTerms)}`);
             ch.appendLine(`daemon log: ${daemonLogPath()}`);
             ch.appendLine('---');

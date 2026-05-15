@@ -101,6 +101,7 @@ interface Client {
 const sessions = new Map<string, Session>();
 const processSessions = new Map<string, ProcessSession>();
 const sessionLabels = new Map<string, string>();
+const sessionLocations = new Map<string, number>();
 const clients = new Set<Client>();
 let scrollbackLinesCap = DEFAULT_SCROLLBACK_LINES;
 let verboseStdioLog = false;
@@ -235,6 +236,7 @@ function createSession(
         session.clients.clear();
         sessions.delete(name);
         sessionLabels.delete(name);
+        sessionLocations.delete(name);
         try { session.emulator.dispose(); } catch { /* ignore */ }
         scheduleIdleExit();
     });
@@ -588,6 +590,7 @@ function createProcessSession(
         session.clients.clear();
         processSessions.delete(name);
         sessionLabels.delete(name);
+        sessionLocations.delete(name);
         scheduleIdleExit();
     });
     proc.on('error', e => {
@@ -672,7 +675,11 @@ function handleMessage(client: Client, msg: ClientMessage) {
             for (const [name, label] of sessionLabels) {
                 if (nameSet.has(name)) labels[name] = label;
             }
-            send(client, { type: 'list_response', names, labels });
+            const locations: Record<string, number> = {};
+            for (const [name, viewColumn] of sessionLocations) {
+                if (nameSet.has(name)) locations[name] = viewColumn;
+            }
+            send(client, { type: 'list_response', names, labels, locations });
             return;
         }
         case 'kill': {
@@ -761,6 +768,19 @@ function handleMessage(client: Client, msg: ClientMessage) {
                 if (sessionLabels.get(msg.name) !== msg.label) {
                     sessionLabels.set(msg.name, msg.label);
                     log('label set', msg.name, '=', msg.label);
+                }
+            }
+            return;
+        }
+        case 'set_location': {
+            if (msg.viewColumn === undefined) {
+                if (sessionLocations.delete(msg.name)) {
+                    log('location cleared', msg.name);
+                }
+            } else {
+                if (sessionLocations.get(msg.name) !== msg.viewColumn) {
+                    sessionLocations.set(msg.name, msg.viewColumn);
+                    log('location set', msg.name, '=', msg.viewColumn);
                 }
             }
             return;
