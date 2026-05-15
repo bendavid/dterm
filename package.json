@@ -2,7 +2,7 @@
   "name": "dterm",
   "displayName": "dterm",
   "description": "Persistent terminal sessions per workspace with auto-reattach. Self-contained — no external daemon required.",
-  "version": "0.3.4",
+  "version": "0.3.5",
   "publisher": "local",
   "license": "MIT",
   "repository": {
@@ -103,6 +103,11 @@
           "type": "boolean",
           "default": false,
           "description": "Log every line of stdio passing through the daemon to claude (both directions). Verbose; useful for protocol debugging. Lines are truncated to 800 bytes."
+        },
+        "dterm.suppressAutoRevive": {
+          "type": "boolean",
+          "default": true,
+          "description": "When `dterm.autoReconnect` is on, suppress VS Code's panel-restoration revival of dterm-profile terminals during the first few seconds after activation. Without this, VS Code's own revival path races with dterm's reconnectAll and spawns one extra fresh terminal per workspace open."
         }
       }
     }
