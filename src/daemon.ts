@@ -101,7 +101,7 @@ interface Client {
 const sessions = new Map<string, Session>();
 const processSessions = new Map<string, ProcessSession>();
 const sessionLabels = new Map<string, string>();
-const sessionLocations = new Map<string, number>();
+const sessionLocations = new Map<string, { viewColumn: number; tabIndex: number }>();
 const clients = new Set<Client>();
 let scrollbackLinesCap = DEFAULT_SCROLLBACK_LINES;
 let verboseStdioLog = false;
@@ -675,9 +675,9 @@ function handleMessage(client: Client, msg: ClientMessage) {
             for (const [name, label] of sessionLabels) {
                 if (nameSet.has(name)) labels[name] = label;
             }
-            const locations: Record<string, number> = {};
-            for (const [name, viewColumn] of sessionLocations) {
-                if (nameSet.has(name)) locations[name] = viewColumn;
+            const locations: Record<string, { viewColumn: number; tabIndex: number }> = {};
+            for (const [name, loc] of sessionLocations) {
+                if (nameSet.has(name)) locations[name] = loc;
             }
             send(client, { type: 'list_response', names, labels, locations });
             return;
@@ -773,14 +773,15 @@ function handleMessage(client: Client, msg: ClientMessage) {
             return;
         }
         case 'set_location': {
-            if (msg.viewColumn === undefined) {
+            if (msg.viewColumn === undefined || msg.tabIndex === undefined) {
                 if (sessionLocations.delete(msg.name)) {
                     log('location cleared', msg.name);
                 }
             } else {
-                if (sessionLocations.get(msg.name) !== msg.viewColumn) {
-                    sessionLocations.set(msg.name, msg.viewColumn);
-                    log('location set', msg.name, '=', msg.viewColumn);
+                const prev = sessionLocations.get(msg.name);
+                if (!prev || prev.viewColumn !== msg.viewColumn || prev.tabIndex !== msg.tabIndex) {
+                    sessionLocations.set(msg.name, { viewColumn: msg.viewColumn, tabIndex: msg.tabIndex });
+                    log('location set', msg.name, '= col', msg.viewColumn, 'idx', msg.tabIndex);
                 }
             }
             return;

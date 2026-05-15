@@ -17,7 +17,12 @@ export type ClientMessage =
     | { type: 'set_scrollback_lines'; lines: number }
     | { type: 'set_verbose_stdio_log'; enabled: boolean }
     | { type: 'set_label'; name: string; label: string | undefined }
-    | { type: 'set_location'; name: string; viewColumn: number | undefined }
+    | {
+          type: 'set_location';
+          name: string;
+          viewColumn: number | undefined;
+          tabIndex: number | undefined;
+      }
     | { type: 'shutdown' }
     | { type: 'version' }
     | {
@@ -40,7 +45,7 @@ export type DaemonMessage =
           type: 'list_response';
           names: string[];
           labels: Record<string, string>;
-          locations: Record<string, number>;
+          locations: Record<string, { viewColumn: number; tabIndex: number }>;
       }
     | { type: 'killed'; name: string }
     | { type: 'session_end'; name: string; exitCode?: number; signal?: number }

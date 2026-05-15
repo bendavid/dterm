@@ -25,9 +25,16 @@ const pendingFocus = new Set<string>();
 // Tracks the last label value we pushed to the daemon for each session, so
 // snapshotLabels doesn't re-send the same value on every tick.
 const pushedLabels = new Map<string, string | undefined>();
-// Same idea for terminal locations (viewColumn when moved to the editor area;
-// undefined means panel).
-const pushedLocations = new Map<string, number | undefined>();
+// Same idea for terminal locations (viewColumn + tabIndex when moved to the
+// editor area; undefined means panel).
+interface TerminalLocation { viewColumn: number; tabIndex: number }
+const pushedLocations = new Map<string, TerminalLocation | undefined>();
+
+function locationsEqual(a: TerminalLocation | undefined, b: TerminalLocation | undefined): boolean {
+    if (!a && !b) return true;
+    if (!a || !b) return false;
+    return a.viewColumn === b.viewColumn && a.tabIndex === b.tabIndex;
+}
 
 function log(line: string): void {
     if (logChannel) logChannel.appendLine(`[${new Date().toISOString()}] ${line}`);
@@ -52,13 +59,18 @@ async function pushLabel(name: string, label: string | undefined): Promise<void>
     await p;
 }
 
-async function pushLocation(name: string, viewColumn: number | undefined): Promise<void> {
-    if (pushedLocations.get(name) === viewColumn) return;
-    pushedLocations.set(name, viewColumn);
-    log(`pushLocation ${name} -> ${viewColumn === undefined ? '(panel)' : `column ${viewColumn}`}`);
+async function pushLocation(name: string, loc: TerminalLocation | undefined): Promise<void> {
+    if (locationsEqual(pushedLocations.get(name), loc)) return;
+    pushedLocations.set(name, loc);
+    log(`pushLocation ${name} -> ${loc === undefined ? '(panel)' : `col ${loc.viewColumn} idx ${loc.tabIndex}`}`);
     const p = oneShot(
         daemonScriptPath(),
-        { type: 'set_location', name, viewColumn },
+        {
+            type: 'set_location',
+            name,
+            viewColumn: loc?.viewColumn,
+            tabIndex: loc?.tabIndex,
+        },
         () => true,
         500,
     );
@@ -93,17 +105,18 @@ function snapshotLabels(): void {
 }
 
 function snapshotLocations(): void {
-    // Build map of session name -> viewColumn for terminals currently in the
-    // editor area. Terminals in the panel are absent from this map.
-    const inEditor = new Map<string, number>();
+    // Build map of session name -> {viewColumn, tabIndex} for terminals
+    // currently in the editor area. Terminals in the panel are absent.
+    const inEditor = new Map<string, TerminalLocation>();
     for (const group of vscode.window.tabGroups.all) {
-        for (const tab of group.tabs) {
+        for (let i = 0; i < group.tabs.length; i++) {
+            const tab = group.tabs[i];
             if (!(tab.input instanceof vscode.TabInputTerminal)) continue;
             for (const t of vscode.window.terminals) {
                 const sName = sessionNameOf(t);
                 if (!sName) continue;
                 if (tab.label === t.name) {
-                    inEditor.set(sName, group.viewColumn);
+                    inEditor.set(sName, { viewColumn: group.viewColumn, tabIndex: i });
                     break;
                 }
             }
@@ -113,7 +126,7 @@ function snapshotLocations(): void {
         const sName = sessionNameOf(t);
         if (!sName) continue;
         const target = inEditor.get(sName);
-        if (pushedLocations.get(sName) !== target) {
+        if (!locationsEqual(pushedLocations.get(sName), target)) {
             void pushLocation(sName, target);
         }
     }
@@ -156,7 +169,7 @@ function workspaceTag(): string | undefined {
 interface DaemonSessions {
     names: string[];
     labels: Record<string, string>;
-    locations: Record<string, number>;
+    locations: Record<string, TerminalLocation>;
 }
 
 async function fetchDaemonSessions(): Promise<DaemonSessions | undefined> {
@@ -450,7 +463,23 @@ async function reconnectAll(
         vscode.window.terminals.map(sessionNameOf).filter((n): n is string => Boolean(n)),
     );
     const cwd = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
-    for (const name of ours) {
+    // Sort so editor-area sessions create in their stored (viewColumn, tabIndex)
+    // order — VS Code appends new terminals at the end of the target group, so
+    // creation order is what preserves relative position within each column.
+    // Panel sessions (no location) sort by name and end up last; their order in
+    // the panel tab strip isn't directly controllable.
+    const sortedOurs = ours.slice().sort((a, b) => {
+        const la = live.locations[a];
+        const lb = live.locations[b];
+        if (la && lb) {
+            if (la.viewColumn !== lb.viewColumn) return la.viewColumn - lb.viewColumn;
+            return la.tabIndex - lb.tabIndex;
+        }
+        if (la) return -1;
+        if (lb) return 1;
+        return a.localeCompare(b);
+    });
+    for (const name of sortedOurs) {
         if (alreadyOpen.has(name)) {
             const t = vscode.window.terminals.find(t => sessionNameOf(t) === name);
             const pty = t ? ptyOf(t) : undefined;
@@ -462,8 +491,9 @@ async function reconnectAll(
             }
             continue;
         }
-        log(`reconnectAll: creating terminal for ${name} (col=${live.locations[name] ?? 'panel'})`);
-        vscode.window.createTerminal(buildOptions(name, cwd, live.labels[name], live.locations[name]));
+        const loc = live.locations[name];
+        log(`reconnectAll: creating terminal for ${name} (${loc ? `col ${loc.viewColumn} idx ${loc.tabIndex}` : 'panel'})`);
+        vscode.window.createTerminal(buildOptions(name, cwd, live.labels[name], loc?.viewColumn));
     }
 }
 
