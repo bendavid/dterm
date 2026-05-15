@@ -1,5 +1,0 @@
-# dterm: source the user's bashrc, then install a SIGUSR1 hook that the
-# daemon sends after writing fresh env vars (e.g. SSH_AUTH_SOCK) into
-# $DTERM_ENV_FILE on reattach.
-[ -r ~/.bashrc ] && . ~/.bashrc
-trap '[ -n "$DTERM_ENV_FILE" ] && [ -r "$DTERM_ENV_FILE" ] && . "$DTERM_ENV_FILE"' SIGUSR1

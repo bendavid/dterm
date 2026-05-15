@@ -6,7 +6,7 @@ import * as cp from 'child_process';
 import * as os from 'os';
 import { DtermPseudoterminal } from './pty';
 import { oneShot, readDaemonLogTail, isDaemonAlive } from './client';
-import { daemonLogPath, envFilePath, socketPath } from './paths';
+import { agentDir, daemonLogPath, socketPath } from './paths';
 
 const PROFILE_ID = 'dterm.profile';
 
@@ -182,46 +182,72 @@ function shellConfig() {
         shell: shell.length > 0 ? shell : undefined,
         shellArgs: cfg.get<string[]>('shellArgs', []) ?? [],
         scrollbackLines: effectiveScrollbackLines(),
-        refreshVscodeSshAuthSock: cfg.get<boolean>('refreshVscodeSshAuthSock', true),
     };
 }
 
-interface ShellShim {
-    extraArgs: string[];
-    extraEnv: Record<string, string>;
+interface ManagedSocket {
+    envVar: string;
+    linkName: string;
 }
 
-const FISH_TRAP_SNIPPET =
-    'function __dterm_refresh --on-signal USR1; ' +
-    'test -r "$DTERM_ENV_FILE"; and source "$DTERM_ENV_FILE"; ' +
-    'end';
+// VS Code-managed Unix sockets that go stale across server restarts / client
+// reconnects. We expose a per-workspace symlink path to the shell and re-point
+// it whenever the upstream value in process.env changes — running shells keep
+// the same SSH_AUTH_SOCK / VSCODE_IPC_HOOK_CLI / VSCODE_GIT_IPC_HANDLE in their
+// env but transparently start using the new target on the next connect().
+const MANAGED_SOCKETS: ManagedSocket[] = [
+    { envVar: 'SSH_AUTH_SOCK',         linkName: 'ssh-auth.sock' },
+    { envVar: 'VSCODE_IPC_HOOK_CLI',   linkName: 'vscode-ipc.sock' },
+    { envVar: 'VSCODE_GIT_IPC_HANDLE', linkName: 'vscode-git-ipc.sock' },
+];
 
-function resolveShellBinary(configured: string | undefined): string {
-    if (configured && configured.length > 0) return configured;
-    return process.env.SHELL || (process.platform === 'win32' ? 'powershell.exe' : '/bin/bash');
+function updateSymlinkAtomic(target: string, linkPath: string): boolean {
+    const tmp = `${linkPath}.tmp.${process.pid}.${Date.now()}`;
+    try {
+        fs.symlinkSync(target, tmp);
+    } catch (e) {
+        log(`symlink create failed: ${linkPath} -> ${target}: ${(e as Error).message}`);
+        return false;
+    }
+    try {
+        fs.renameSync(tmp, linkPath);
+        return true;
+    } catch (e) {
+        log(`symlink rename failed: ${linkPath}: ${(e as Error).message}`);
+        try { fs.unlinkSync(tmp); } catch { /* ignore */ }
+        return false;
+    }
 }
 
-function pickShellShim(shellBinary: string, extensionPath: string): ShellShim | undefined {
-    const base = path.basename(shellBinary);
-    if (base === 'bash') {
-        return {
-            extraArgs: ['--rcfile', path.join(extensionPath, 'out', 'rc', 'bash.rc')],
-            extraEnv: {},
-        };
+function refreshManagedSockets(): Record<string, string> {
+    const overrides: Record<string, string> = {};
+    const tag = workspaceTag();
+    if (!tag) return overrides;
+    const dir = agentDir(tag);
+    let dirEnsured = false;
+    for (const m of MANAGED_SOCKETS) {
+        const upstream = process.env[m.envVar];
+        if (!upstream) continue;
+        if (!dirEnsured) {
+            try {
+                fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+                dirEnsured = true;
+            } catch (e) {
+                log(`failed to create agent dir ${dir}: ${(e as Error).message}`);
+                return overrides;
+            }
+        }
+        const linkPath = path.join(dir, m.linkName);
+        let currentTarget: string | undefined;
+        try { currentTarget = fs.readlinkSync(linkPath); } catch { /* absent */ }
+        if (currentTarget !== upstream) {
+            if (updateSymlinkAtomic(upstream, linkPath)) {
+                log(`symlink: ${m.envVar} -> ${upstream}`);
+            }
+        }
+        overrides[m.envVar] = linkPath;
     }
-    if (base === 'zsh') {
-        return {
-            extraArgs: [],
-            extraEnv: {
-                ZDOTDIR: path.join(extensionPath, 'out', 'rc', 'zsh'),
-                DTERM_USER_ZDOTDIR: process.env.ZDOTDIR ?? '',
-            },
-        };
-    }
-    if (base === 'fish') {
-        return { extraArgs: ['-C', FISH_TRAP_SNIPPET], extraEnv: {} };
-    }
-    return undefined;
+    return overrides;
 }
 
 function currentExtensionHostEnv(): Record<string, string> {
@@ -229,6 +255,7 @@ function currentExtensionHostEnv(): Record<string, string> {
     for (const [k, v] of Object.entries(process.env)) {
         if (typeof v === 'string') env[k] = v;
     }
+    for (const [k, v] of Object.entries(refreshManagedSockets())) env[k] = v;
     return env;
 }
 
@@ -238,27 +265,13 @@ function buildOptions(
     label?: string,
 ): vscode.ExtensionTerminalOptions {
     const cfg = shellConfig();
-    const env = currentExtensionHostEnv();
-    let shellArgs = cfg.shellArgs;
-    if (cfg.refreshVscodeSshAuthSock && activeCtx) {
-        const shellBinary = resolveShellBinary(cfg.shell);
-        const shim = pickShellShim(shellBinary, activeCtx.extensionPath);
-        if (shim) {
-            env.DTERM_ENV_FILE = envFilePath(sessionName);
-            for (const [k, v] of Object.entries(shim.extraEnv)) env[k] = v;
-            shellArgs = [...shim.extraArgs, ...shellArgs];
-            log(`shim: ${path.basename(shellBinary)} for ${sessionName} envFile=${env.DTERM_ENV_FILE}`);
-        } else {
-            log(`shim: no support for ${shellBinary}; SSH_AUTH_SOCK refresh disabled for ${sessionName}`);
-        }
-    }
     const pty = new DtermPseudoterminal({
         sessionName,
         daemonScript: daemonScriptPath(),
         cwd,
         shell: cfg.shell,
-        shellArgs,
-        env,
+        shellArgs: cfg.shellArgs,
+        env: currentExtensionHostEnv(),
         scrollbackLines: cfg.scrollbackLines,
         suppressTitleUpdates: label !== undefined,
         log,
@@ -337,6 +350,7 @@ async function reconnectAll(
     _ctx: vscode.ExtensionContext,
     opts?: { interactive?: boolean },
 ): Promise<void> {
+    refreshManagedSockets();
     const tag = workspaceTag();
     if (!tag) {
         if (opts?.interactive) {
@@ -617,6 +631,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
     ctx.subscriptions.push(logChannel);
     log(`activate: extensionPath=${ctx.extensionPath}`);
     log(`activate: workspaceTag=${workspaceTag() ?? '(none)'}`);
+    refreshManagedSockets();
 
     ctx.subscriptions.push(
         vscode.commands.registerCommand('dterm.restartDaemon', async () => {

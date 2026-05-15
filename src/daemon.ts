@@ -70,12 +70,6 @@ interface Session {
     exited: boolean;
     lastProcessName: string;
     processPoller?: NodeJS.Timeout;
-    // SSH_AUTH_SOCK value last known to be in the shell's env (initially the value
-    // we exec'd with; updated when we push a refresh). envFile is the per-session
-    // path where we write fresh `export ...` lines that the shell's SIGUSR1 trap
-    // sources. Both are undefined when the session wasn't created with our rc shim.
-    knownSshAuthSock?: string;
-    envFile?: string;
 }
 
 interface ProcessSession {
@@ -216,8 +210,6 @@ function createSession(
         clients: new Set(),
         exited: false,
         lastProcessName: '',
-        knownSshAuthSock: opts.env?.SSH_AUTH_SOCK,
-        envFile: opts.env?.DTERM_ENV_FILE,
     };
     session.processPoller = setInterval(() => pollProcessName(session), 750);
     session.processPoller.unref?.();
@@ -244,9 +236,6 @@ function createSession(
         sessions.delete(name);
         sessionLabels.delete(name);
         try { session.emulator.dispose(); } catch { /* ignore */ }
-        if (session.envFile) {
-            try { fs.unlinkSync(session.envFile); } catch { /* may not exist */ }
-        }
         scheduleIdleExit();
     });
 
@@ -610,36 +599,6 @@ function createProcessSession(
     return session;
 }
 
-function isVscodeManagedSshAuthSock(sockPath: string): boolean {
-    return path.basename(sockPath).startsWith('vscode-ssh-auth-');
-}
-
-function maybeRefreshSshAuthSock(
-    session: Session,
-    newEnv: Record<string, string> | undefined,
-): void {
-    if (!session.envFile) return;
-    const newVal = newEnv?.SSH_AUTH_SOCK;
-    const oldVal = session.knownSshAuthSock;
-    if (!newVal || !oldVal || newVal === oldVal) return;
-    if (!isVscodeManagedSshAuthSock(oldVal) || !isVscodeManagedSshAuthSock(newVal)) return;
-    try {
-        fs.mkdirSync(path.dirname(session.envFile), { recursive: true });
-        const escaped = newVal.replace(/'/g, `'\\''`);
-        fs.writeFileSync(session.envFile, `export SSH_AUTH_SOCK='${escaped}'\n`, { mode: 0o600 });
-    } catch (e) {
-        log('SSH_AUTH_SOCK refresh: write failed', session.name, e);
-        return;
-    }
-    try {
-        process.kill(session.pid, 'SIGUSR1');
-        session.knownSshAuthSock = newVal;
-        log(`SSH_AUTH_SOCK refreshed for ${session.name}: ${oldVal} -> ${newVal}`);
-    } catch (e) {
-        log('SSH_AUTH_SOCK refresh: kill failed', session.name, e);
-    }
-}
-
 function handleMessage(client: Client, msg: ClientMessage) {
     switch (msg.type) {
         case 'open': {
@@ -681,9 +640,6 @@ function handleMessage(client: Client, msg: ClientMessage) {
             pollProcessName(session);
             if (session.lastProcessName) {
                 send(client, { type: 'process_name', name: session.lastProcessName });
-            }
-            if (!created) {
-                maybeRefreshSshAuthSock(session, msg.env);
             }
             return;
         }
