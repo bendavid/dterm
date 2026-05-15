@@ -19,3 +19,14 @@ export function socketPath(): string {
 export function daemonLogPath(): string {
     return path.join(os.tmpdir(), `dterm-${userTag()}.log`);
 }
+
+export function envFileDir(): string {
+    const runtime = process.env.XDG_RUNTIME_DIR;
+    if (runtime) return path.join(runtime, 'dterm', 'env');
+    return path.join(os.tmpdir(), `dterm-${userTag()}`, 'env');
+}
+
+export function envFilePath(sessionName: string): string {
+    const safe = sessionName.replace(/[^a-zA-Z0-9._-]/g, '_');
+    return path.join(envFileDir(), `${safe}.sh`);
+}

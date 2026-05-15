@@ -2,7 +2,7 @@
   "name": "dterm",
   "displayName": "dterm",
   "description": "Persistent terminal sessions per workspace with auto-reattach. Self-contained — no external daemon required.",
-  "version": "0.3.2",
+  "version": "0.3.3",
   "publisher": "local",
   "license": "MIT",
   "repository": {
@@ -103,12 +103,17 @@
           "type": "boolean",
           "default": false,
           "description": "Log every line of stdio passing through the daemon to claude (both directions). Verbose; useful for protocol debugging. Lines are truncated to 800 bytes."
+        },
+        "dterm.refreshVscodeSshAuthSock": {
+          "type": "boolean",
+          "default": true,
+          "description": "When reattaching from a different VS Code client, refresh SSH_AUTH_SOCK in the running shell if it points to a VS Code-managed socket (basename starts with `vscode-ssh-auth-`). Requires a small shell shim (bash --rcfile, zsh ZDOTDIR, fish -C) to install a SIGUSR1 hook. Supports bash/zsh/fish; other shells silently skip."
         }
       }
     }
   },
   "scripts": {
-    "compile": "tsc -p . && mv -f out/wrapper.js out/dterm-wrapper && chmod +x out/dterm-wrapper",
+    "compile": "tsc -p . && mv -f out/wrapper.js out/dterm-wrapper && chmod +x out/dterm-wrapper && rm -rf out/rc && cp -R src/rc out/rc",
     "watch": "tsc -p . -w",
     "clean-staged-prebuild": "rm -rf node_modules/node-pty/prebuilds/linux-x64 node_modules/node-pty/prebuilds/linux-arm64",
     "vscode:prepublish": "npm run compile"

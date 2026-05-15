@@ -6,7 +6,7 @@ import * as cp from 'child_process';
 import * as os from 'os';
 import { DtermPseudoterminal } from './pty';
 import { oneShot, readDaemonLogTail, isDaemonAlive } from './client';
-import { daemonLogPath, socketPath } from './paths';
+import { daemonLogPath, envFilePath, socketPath } from './paths';
 
 const PROFILE_ID = 'dterm.profile';
 
@@ -182,7 +182,46 @@ function shellConfig() {
         shell: shell.length > 0 ? shell : undefined,
         shellArgs: cfg.get<string[]>('shellArgs', []) ?? [],
         scrollbackLines: effectiveScrollbackLines(),
+        refreshVscodeSshAuthSock: cfg.get<boolean>('refreshVscodeSshAuthSock', true),
     };
+}
+
+interface ShellShim {
+    extraArgs: string[];
+    extraEnv: Record<string, string>;
+}
+
+const FISH_TRAP_SNIPPET =
+    'function __dterm_refresh --on-signal USR1; ' +
+    'test -r "$DTERM_ENV_FILE"; and source "$DTERM_ENV_FILE"; ' +
+    'end';
+
+function resolveShellBinary(configured: string | undefined): string {
+    if (configured && configured.length > 0) return configured;
+    return process.env.SHELL || (process.platform === 'win32' ? 'powershell.exe' : '/bin/bash');
+}
+
+function pickShellShim(shellBinary: string, extensionPath: string): ShellShim | undefined {
+    const base = path.basename(shellBinary);
+    if (base === 'bash') {
+        return {
+            extraArgs: ['--rcfile', path.join(extensionPath, 'out', 'rc', 'bash.rc')],
+            extraEnv: {},
+        };
+    }
+    if (base === 'zsh') {
+        return {
+            extraArgs: [],
+            extraEnv: {
+                ZDOTDIR: path.join(extensionPath, 'out', 'rc', 'zsh'),
+                DTERM_USER_ZDOTDIR: process.env.ZDOTDIR ?? '',
+            },
+        };
+    }
+    if (base === 'fish') {
+        return { extraArgs: ['-C', FISH_TRAP_SNIPPET], extraEnv: {} };
+    }
+    return undefined;
 }
 
 function currentExtensionHostEnv(): Record<string, string> {
@@ -199,13 +238,27 @@ function buildOptions(
     label?: string,
 ): vscode.ExtensionTerminalOptions {
     const cfg = shellConfig();
+    const env = currentExtensionHostEnv();
+    let shellArgs = cfg.shellArgs;
+    if (cfg.refreshVscodeSshAuthSock && activeCtx) {
+        const shellBinary = resolveShellBinary(cfg.shell);
+        const shim = pickShellShim(shellBinary, activeCtx.extensionPath);
+        if (shim) {
+            env.DTERM_ENV_FILE = envFilePath(sessionName);
+            for (const [k, v] of Object.entries(shim.extraEnv)) env[k] = v;
+            shellArgs = [...shim.extraArgs, ...shellArgs];
+            log(`shim: ${path.basename(shellBinary)} for ${sessionName} envFile=${env.DTERM_ENV_FILE}`);
+        } else {
+            log(`shim: no support for ${shellBinary}; SSH_AUTH_SOCK refresh disabled for ${sessionName}`);
+        }
+    }
     const pty = new DtermPseudoterminal({
         sessionName,
         daemonScript: daemonScriptPath(),
         cwd,
         shell: cfg.shell,
-        shellArgs: cfg.shellArgs,
-        env: currentExtensionHostEnv(),
+        shellArgs,
+        env,
         scrollbackLines: cfg.scrollbackLines,
         suppressTitleUpdates: label !== undefined,
         log,
