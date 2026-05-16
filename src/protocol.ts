@@ -15,7 +15,6 @@ export type ClientMessage =
     | { type: 'kill'; name: string }
     | { type: 'detach' }
     | { type: 'set_scrollback_lines'; lines: number }
-    | { type: 'set_verbose_stdio_log'; enabled: boolean }
     | { type: 'set_label'; name: string; label: string | undefined }
     | {
           type: 'set_location';
@@ -24,18 +23,7 @@ export type ClientMessage =
           tabIndex: number | undefined;
       }
     | { type: 'shutdown' }
-    | { type: 'version' }
-    | {
-          type: 'open_process';
-          name: string;
-          executable: string;
-          args: string[];
-          cwd?: string;
-          env?: Record<string, string>;
-      }
-    | { type: 'process_input'; data: string }
-    | { type: 'process_close_stdin' }
-    | { type: 'hook_event'; event: string; sessionName: string; payload: unknown };
+    | { type: 'version' };
 
 export type DaemonMessage =
     | { type: 'opened'; name: string; cols: number; rows: number; created: boolean }
@@ -50,9 +38,7 @@ export type DaemonMessage =
     | { type: 'killed'; name: string }
     | { type: 'session_end'; name: string; exitCode?: number; signal?: number }
     | { type: 'version_response'; version: string }
-    | { type: 'error'; message: string }
-    | { type: 'process_opened'; name: string; created: boolean; pid?: number }
-    | { type: 'process_output'; stream: 'stdout' | 'stderr'; data: string };
+    | { type: 'error'; message: string };
 
 export function encode(msg: ClientMessage | DaemonMessage): string {
     return JSON.stringify(msg) + '\n';

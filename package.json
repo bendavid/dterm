@@ -2,7 +2,7 @@
   "name": "dterm",
   "displayName": "dterm",
   "description": "Persistent terminal sessions per workspace with auto-reattach. Self-contained — no external daemon required.",
-  "version": "0.3.7",
+  "version": "0.4.0",
   "publisher": "local",
   "license": "MIT",
   "repository": {
@@ -64,14 +64,6 @@
       {
         "command": "dterm.pushDaemonSettings",
         "title": "dterm: Push current settings to daemon"
-      },
-      {
-        "command": "dterm.installClaudeWrapper",
-        "title": "dterm: Install as Claude Code process wrapper"
-      },
-      {
-        "command": "dterm.uninstallClaudeWrapper",
-        "title": "dterm: Uninstall as Claude Code process wrapper"
       }
     ],
     "configuration": {
@@ -99,11 +91,6 @@
           "default": [],
           "description": "Arguments passed to the shell on new sessions."
         },
-        "dterm.verboseStdioLog": {
-          "type": "boolean",
-          "default": false,
-          "description": "Log every line of stdio passing through the daemon to claude (both directions). Verbose; useful for protocol debugging. Lines are truncated to 800 bytes."
-        },
         "dterm.suppressAutoRevive": {
           "type": "boolean",
           "default": true,
@@ -113,7 +100,7 @@
     }
   },
   "scripts": {
-    "compile": "tsc -p . && mv -f out/wrapper.js out/dterm-wrapper && chmod +x out/dterm-wrapper",
+    "compile": "tsc -p .",
     "watch": "tsc -p . -w",
     "clean-staged-prebuild": "rm -rf node_modules/node-pty/prebuilds/linux-x64 node_modules/node-pty/prebuilds/linux-arm64",
     "vscode:prepublish": "npm run compile"

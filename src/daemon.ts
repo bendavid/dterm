@@ -1,7 +1,6 @@
 import * as net from 'net';
 import * as fs from 'fs';
 import * as path from 'path';
-import * as cp from 'child_process';
 import { socketPath } from './paths';
 import { LineStream, encode } from './protocol';
 import type { ClientMessage, DaemonMessage } from './protocol';
@@ -72,44 +71,18 @@ interface Session {
     processPoller?: NodeJS.Timeout;
 }
 
-interface ProcessSession {
-    name: string;
-    proc: cp.ChildProcessWithoutNullStreams;
-    pid: number;
-    exited: boolean;
-    clients: Set<Client>;
-    stdinClosed: boolean;
-    inputLineBuf: string;
-    outputLineBuf: string;
-    pendingInitRequestIds: Set<string>;
-    cachedInitResponse: { type: string; response: Record<string, unknown> } | undefined;
-    cachedBridgeState: Record<string, unknown> | undefined;
-    cachedRemoteControlResponse: { type: string; response: Record<string, unknown> } | undefined;
-    claudeSessionId: string | undefined;
-    idleSince: number | undefined;
-    ended: boolean;
-    sessionEndReason: string | undefined;
-}
-
 interface Client {
     socket: net.Socket;
     parser: LineStream<ClientMessage>;
     session?: Session;
-    processSession?: ProcessSession;
 }
 
 const sessions = new Map<string, Session>();
-const processSessions = new Map<string, ProcessSession>();
 const sessionLabels = new Map<string, string>();
 const sessionLocations = new Map<string, { viewColumn: number; tabIndex: number }>();
 const clients = new Set<Client>();
 let scrollbackLinesCap = DEFAULT_SCROLLBACK_LINES;
-let verboseStdioLog = false;
 let idleTimer: NodeJS.Timeout | undefined;
-
-function truncForLog(s: string, max = 800): string {
-    return s.length > max ? s.slice(0, max) + '…(' + s.length + 'b)' : s;
-}
 
 function log(...parts: unknown[]) {
     console.error(`[${new Date().toISOString()}]`, ...parts);
@@ -246,362 +219,6 @@ function createSession(
     return session;
 }
 
-function isObj(x: unknown): x is Record<string, unknown> {
-    return typeof x === 'object' && x !== null && !Array.isArray(x);
-}
-
-function handleHookEvent(sessionName: string, event: string, payload: unknown): void {
-    const session = processSessions.get(sessionName);
-    if (!session) {
-        log(`hook_event ${event} for unknown session ${sessionName}`);
-        return;
-    }
-    switch (event) {
-        case 'SessionStart': {
-            const sid = isObj(payload) && typeof payload.session_id === 'string' ? payload.session_id : undefined;
-            const source = isObj(payload) && typeof payload.source === 'string' ? payload.source : undefined;
-            if (!sid) {
-                log(`SessionStart hook for ${session.name} missing session_id`);
-                return;
-            }
-            if (session.claudeSessionId !== sid) session.claudeSessionId = sid;
-            const canonical = `claude-${sid}`;
-            if (session.name === canonical) {
-                log(`SessionStart hook for ${session.name} (source=${source ?? '?'})`);
-                return;
-            }
-            const oldName = session.name;
-            const existing = processSessions.get(canonical);
-            if (existing && existing !== session) {
-                log(`SessionStart rekey conflict: ${oldName} -> ${canonical} already exists; not renaming`);
-                return;
-            }
-            processSessions.delete(oldName);
-            session.name = canonical;
-            processSessions.set(canonical, session);
-            log(`session rekeyed by SessionStart hook: ${oldName} -> ${canonical} (source=${source ?? '?'})`);
-            return;
-        }
-        case 'Stop': {
-            session.idleSince = Date.now();
-            log(`Stop hook: session ${session.name} idle`);
-            return;
-        }
-        case 'SessionEnd': {
-            const reason = isObj(payload) && typeof payload.reason === 'string' ? payload.reason : undefined;
-            session.ended = true;
-            session.sessionEndReason = reason;
-            log(`SessionEnd hook: session ${session.name} reason=${reason ?? '?'}`);
-            return;
-        }
-        default:
-            log(`unhandled hook event ${event} for ${session.name}`);
-    }
-}
-
-function parseStdoutLineForRemoteControlResp(session: ProcessSession, line: string): void {
-    if (!line.includes('"session_url"')) return;
-    try {
-        const obj = JSON.parse(line);
-        if (
-            obj && obj.type === 'control_response' &&
-            obj.response && obj.response.subtype === 'success' &&
-            obj.response.response && typeof obj.response.response === 'object' &&
-            typeof obj.response.response.session_url === 'string'
-        ) {
-            session.cachedRemoteControlResponse = obj;
-            log(
-                `cached remote_control response for ${session.name} session_url=${obj.response.response.session_url}`,
-            );
-        }
-    } catch {
-        // not JSON
-    }
-}
-
-function parseStdoutLineForBridgeState(session: ProcessSession, line: string): void {
-    if (!line.includes('"bridge_state"')) return;
-    try {
-        const obj = JSON.parse(line);
-        if (obj && obj.type === 'system' && obj.subtype === 'bridge_state') {
-            session.cachedBridgeState = obj;
-            log(`cached bridge_state for ${session.name} state=${obj.state ?? '?'}`);
-        }
-    } catch {
-        // not JSON
-    }
-}
-
-function parseStdoutLineForInit(session: ProcessSession, line: string): void {
-    if (!line.includes('"control_response"')) return;
-    try {
-        const obj = JSON.parse(line);
-        if (obj && obj.type === 'control_response' && obj.response && typeof obj.response === 'object') {
-            const respId: string | undefined = obj.response.request_id;
-            const subtype: string | undefined = obj.response.subtype;
-            if (respId && subtype === 'success' && session.pendingInitRequestIds.has(respId)) {
-                session.pendingInitRequestIds.delete(respId);
-                session.cachedInitResponse = obj;
-                log('cached init response for', session.name, 'reqId=', respId);
-            }
-        }
-    } catch {
-        // not JSON — fine
-    }
-}
-
-function logPermissionTraffic(direction: 'claude->client' | 'client->claude', session: ProcessSession, line: string): void {
-    if (!line.includes('"can_use_tool"') && !line.includes('"control_response"')) return;
-    try {
-        const obj = JSON.parse(line);
-        if (obj?.type === 'control_request' && obj.request?.subtype === 'can_use_tool') {
-            log(`perm ${direction} REQ session=${session.name} reqId=${obj.request_id} tool=${obj.request.tool_name ?? '?'}`);
-        } else if (obj?.type === 'control_response' && obj.response) {
-            const sub = obj.response.subtype;
-            const reqId = obj.response.request_id;
-            const inner = obj.response.response;
-            const behavior = inner?.behavior;
-            log(`perm ${direction} RESP session=${session.name} reqId=${reqId} subtype=${sub} behavior=${behavior ?? '?'}`);
-        }
-    } catch { /* ignore non-JSON */ }
-}
-
-function handleHookCallbackWhenUnattended(session: ProcessSession, line: string): void {
-    if (session.clients.size > 0) return;
-    if (!line.includes('"hook_callback"')) return;
-    try {
-        const obj = JSON.parse(line);
-        if (obj?.type !== 'control_request') return;
-        if (obj.request?.subtype !== 'hook_callback') return;
-        const reqId: string | undefined = obj.request_id;
-        if (!reqId) return;
-        const callbackId = obj.request?.callback_id ?? '?';
-        const hookEvent = obj.request?.input?.hook_event_name ?? '?';
-        const out =
-            JSON.stringify({
-                type: 'control_response',
-                response: {
-                    subtype: 'success',
-                    request_id: reqId,
-                    response: { continue: true },
-                },
-            }) + '\n';
-        try {
-            session.proc.stdin.write(out);
-            log(
-                `stub hook_callback for ${session.name} reqId=${reqId} callback=${callbackId} event=${hookEvent}`,
-            );
-        } catch (e) {
-            log('failed to write hook stub response', session.name, e);
-        }
-    } catch {
-        // not JSON
-    }
-}
-
-function handleProcessInputBytes(
-    session: ProcessSession,
-    data: Buffer,
-    originatingClient: Client,
-): void {
-    session.inputLineBuf += data.toString('utf8');
-    const toForward: string[] = [];
-    let nl: number;
-    while ((nl = session.inputLineBuf.indexOf('\n')) >= 0) {
-        const line = session.inputLineBuf.slice(0, nl);
-        session.inputLineBuf = session.inputLineBuf.slice(nl + 1);
-        if (verboseStdioLog) log(`stdio client->claude session=${session.name} ${truncForLog(line)}`);
-        const action = processInputLine(session, line, originatingClient);
-        logPermissionTraffic('client->claude', session, line);
-        if (action === 'forward') toForward.push(line + '\n');
-    }
-    if (toForward.length > 0) {
-        try {
-            session.proc.stdin.write(toForward.join(''));
-        } catch (e) {
-            log('process_input write failed', session.name, e);
-        }
-    }
-}
-
-function processInputLine(
-    session: ProcessSession,
-    line: string,
-    originatingClient: Client,
-): 'forward' | 'intercepted' {
-    if (!line.includes('"control_request"')) return 'forward';
-    try {
-        const msg = JSON.parse(line);
-        if (
-            msg && msg.type === 'control_request' &&
-            msg.request && msg.request.subtype === 'remote_control'
-        ) {
-            const reqId: string | undefined = msg.request_id;
-            const enabled = msg.request.enabled;
-            if (enabled === false) {
-                // User wants to actually disable — invalidate cache, let claude do the work.
-                session.cachedRemoteControlResponse = undefined;
-                session.cachedBridgeState = undefined;
-                log(`remote_control disable: clearing cache for ${session.name}`);
-                return 'forward';
-            }
-            if (enabled === true && reqId && session.cachedRemoteControlResponse) {
-                const cached = session.cachedRemoteControlResponse;
-                const synthesized = {
-                    type: cached.type,
-                    response: {
-                        ...cached.response,
-                        request_id: reqId,
-                    },
-                };
-                const out = JSON.stringify(synthesized) + '\n';
-                send(originatingClient, {
-                    type: 'process_output',
-                    stream: 'stdout',
-                    data: Buffer.from(out, 'utf8').toString('base64'),
-                });
-                log(`synthesized remote_control response for ${session.name} reqId=${reqId}`);
-                if (session.cachedBridgeState) {
-                    const bridgeLine = JSON.stringify(session.cachedBridgeState) + '\n';
-                    send(originatingClient, {
-                        type: 'process_output',
-                        stream: 'stdout',
-                        data: Buffer.from(bridgeLine, 'utf8').toString('base64'),
-                    });
-                }
-                return 'intercepted';
-            }
-        }
-        if (
-            msg && msg.type === 'control_request' &&
-            msg.request && msg.request.subtype === 'initialize'
-        ) {
-            const reqId: string | undefined = msg.request_id;
-            if (session.cachedInitResponse) {
-                const cached = session.cachedInitResponse;
-                const synthesized = {
-                    type: cached.type,
-                    response: {
-                        ...cached.response,
-                        request_id: reqId,
-                    },
-                };
-                const out = JSON.stringify(synthesized) + '\n';
-                send(originatingClient, {
-                    type: 'process_output',
-                    stream: 'stdout',
-                    data: Buffer.from(out, 'utf8').toString('base64'),
-                });
-                log('synthesized init response for', session.name, 'reqId=', reqId);
-                if (session.cachedBridgeState) {
-                    const bridgeLine = JSON.stringify(session.cachedBridgeState) + '\n';
-                    send(originatingClient, {
-                        type: 'process_output',
-                        stream: 'stdout',
-                        data: Buffer.from(bridgeLine, 'utf8').toString('base64'),
-                    });
-                    log(
-                        'replayed bridge_state for',
-                        session.name,
-                        'state=',
-                        session.cachedBridgeState.state ?? '?',
-                    );
-                }
-                return 'intercepted';
-            } else if (reqId) {
-                session.pendingInitRequestIds.add(reqId);
-            }
-        }
-    } catch {
-        // not JSON — forward as-is
-    }
-    return 'forward';
-}
-
-function createProcessSession(
-    name: string,
-    executable: string,
-    args: string[],
-    opts: { cwd?: string; env?: Record<string, string> },
-): ProcessSession {
-    const env = buildShellEnv(opts.env);
-    const proc = cp.spawn(executable, args, {
-        cwd: opts.cwd || env.HOME || '/',
-        env: env as NodeJS.ProcessEnv,
-        stdio: ['pipe', 'pipe', 'pipe'],
-        detached: true,
-    });
-
-    const session: ProcessSession = {
-        name,
-        proc,
-        pid: proc.pid ?? -1,
-        exited: false,
-        clients: new Set(),
-        stdinClosed: false,
-        inputLineBuf: '',
-        outputLineBuf: '',
-        pendingInitRequestIds: new Set(),
-        cachedInitResponse: undefined,
-        cachedBridgeState: undefined,
-        cachedRemoteControlResponse: undefined,
-        claudeSessionId: undefined,
-        idleSince: undefined,
-        ended: false,
-        sessionEndReason: undefined,
-    };
-
-    proc.stdout.on('data', (chunk: Buffer) => {
-        const msg: DaemonMessage = { type: 'process_output', stream: 'stdout', data: chunk.toString('base64') };
-        for (const c of session.clients) send(c, msg);
-        session.outputLineBuf += chunk.toString('utf8');
-        let nl: number;
-        while ((nl = session.outputLineBuf.indexOf('\n')) >= 0) {
-            const line = session.outputLineBuf.slice(0, nl);
-            session.outputLineBuf = session.outputLineBuf.slice(nl + 1);
-            if (verboseStdioLog) log(`stdio claude->client session=${session.name} ${truncForLog(line)}`);
-            parseStdoutLineForInit(session, line);
-            parseStdoutLineForBridgeState(session, line);
-            parseStdoutLineForRemoteControlResp(session, line);
-            logPermissionTraffic('claude->client', session, line);
-            handleHookCallbackWhenUnattended(session, line);
-        }
-    });
-    proc.stderr.on('data', (chunk: Buffer) => {
-        const msg: DaemonMessage = { type: 'process_output', stream: 'stderr', data: chunk.toString('base64') };
-        for (const c of session.clients) send(c, msg);
-        if (verboseStdioLog) {
-            const text = chunk.toString('utf8');
-            for (const line of text.split('\n')) {
-                if (line) log(`stderr session=${session.name} ${truncForLog(line)}`);
-            }
-        }
-    });
-    proc.stdin.on('error', () => {
-        session.stdinClosed = true;
-    });
-    proc.on('exit', (exitCode, signal) => {
-        session.exited = true;
-        log('process session exit', name, exitCode, signal);
-        for (const c of [...session.clients]) {
-            send(c, { type: 'session_end', name, exitCode: exitCode ?? undefined, signal: typeof signal === 'string' ? undefined : signal ?? undefined });
-            c.processSession = undefined;
-        }
-        session.clients.clear();
-        processSessions.delete(name);
-        sessionLabels.delete(name);
-        sessionLocations.delete(name);
-        scheduleIdleExit();
-    });
-    proc.on('error', e => {
-        log('process spawn error', name, e);
-    });
-
-    processSessions.set(name, session);
-    log('process session created', name, executable, args.join(' '));
-    return session;
-}
-
 function handleMessage(client: Client, msg: ClientMessage) {
     switch (msg.type) {
         case 'open': {
@@ -669,7 +286,7 @@ function handleMessage(client: Client, msg: ClientMessage) {
             return;
         }
         case 'list': {
-            const names = [...sessions.keys(), ...processSessions.keys()];
+            const names = [...sessions.keys()];
             const nameSet = new Set(names);
             const labels: Record<string, string> = {};
             for (const [name, label] of sessionLabels) {
@@ -687,10 +304,6 @@ function handleMessage(client: Client, msg: ClientMessage) {
             if (s) {
                 try { s.pty.kill(); } catch { /* may already be dead */ }
             }
-            const ps = processSessions.get(msg.name);
-            if (ps) {
-                try { ps.proc.kill('SIGTERM'); } catch { /* may already be dead */ }
-            }
             send(client, { type: 'killed', name: msg.name });
             return;
         }
@@ -699,50 +312,6 @@ function handleMessage(client: Client, msg: ClientMessage) {
                 client.session.clients.delete(client);
                 client.session = undefined;
             }
-            if (client.processSession) {
-                client.processSession.clients.delete(client);
-                client.processSession = undefined;
-            }
-            return;
-        }
-        case 'open_process': {
-            cancelIdleExit();
-            let session = processSessions.get(msg.name);
-            let created = false;
-            if (!session) {
-                session = createProcessSession(msg.name, msg.executable, msg.args, {
-                    cwd: msg.cwd,
-                    env: msg.env,
-                });
-                created = true;
-            }
-            if (client.processSession && client.processSession !== session) {
-                client.processSession.clients.delete(client);
-            }
-            client.processSession = session;
-            session.clients.add(client);
-            send(client, { type: 'process_opened', name: msg.name, created, pid: session.pid });
-            return;
-        }
-        case 'process_input': {
-            const ps = client.processSession;
-            if (!ps || ps.exited || ps.stdinClosed) return;
-            handleProcessInputBytes(ps, Buffer.from(msg.data, 'base64'), client);
-            return;
-        }
-        case 'process_close_stdin': {
-            const ps = client.processSession;
-            if (!ps || ps.stdinClosed) return;
-            ps.stdinClosed = true;
-            try {
-                ps.proc.stdin.end();
-            } catch (e) {
-                log('process_close_stdin failed', ps.name, e);
-            }
-            return;
-        }
-        case 'hook_event': {
-            handleHookEvent(msg.sessionName, msg.event, msg.payload);
             return;
         }
         case 'set_scrollback_lines': {
@@ -752,11 +321,6 @@ function handleMessage(client: Client, msg: ClientMessage) {
                 s.linesCap = n;
                 try { s.emulator.options.scrollback = n; } catch (e) { log('scrollback resize failed', s.name, e); }
             }
-            return;
-        }
-        case 'set_verbose_stdio_log': {
-            verboseStdioLog = msg.enabled;
-            log('verboseStdioLog set to', msg.enabled);
             return;
         }
         case 'set_label': {
@@ -791,9 +355,6 @@ function handleMessage(client: Client, msg: ClientMessage) {
             for (const s of sessions.values()) {
                 try { s.pty.kill(); } catch { /* may already be dead */ }
             }
-            for (const ps of processSessions.values()) {
-                try { ps.proc.kill('SIGTERM'); } catch { /* may already be dead */ }
-            }
             setTimeout(() => process.exit(0), 100);
             return;
         }
@@ -821,7 +382,6 @@ function handleConnection(socket: net.Socket) {
     });
     const onGone = () => {
         if (client.session) client.session.clients.delete(client);
-        if (client.processSession) client.processSession.clients.delete(client);
         clients.delete(client);
         log('client gone');
         scheduleIdleExit();
@@ -831,10 +391,10 @@ function handleConnection(socket: net.Socket) {
 }
 
 function scheduleIdleExit() {
-    if (sessions.size > 0 || processSessions.size > 0 || clients.size > 0) return;
+    if (sessions.size > 0 || clients.size > 0) return;
     if (idleTimer) return;
     idleTimer = setTimeout(() => {
-        if (sessions.size === 0 && processSessions.size === 0 && clients.size === 0) {
+        if (sessions.size === 0 && clients.size === 0) {
             log('idle exit');
             process.exit(0);
         }

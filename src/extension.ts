@@ -210,17 +210,6 @@ function daemonScriptPath(): string {
     return path.join(activeCtx.extensionPath, 'out', 'daemon.js');
 }
 
-async function pushVerboseStdioLog(): Promise<void> {
-    const enabled = vscode.workspace.getConfiguration('dterm').get<boolean>('verboseStdioLog', false);
-    log(`config: pushing verboseStdioLog=${enabled}`);
-    await oneShot(
-        daemonScriptPath(),
-        { type: 'set_verbose_stdio_log', enabled },
-        () => true,
-        500,
-    );
-}
-
 async function pushScrollbackLines(): Promise<void> {
     const lines = effectiveScrollbackLines();
     log(`config: pushing scrollbackLines=${lines}`);
@@ -233,7 +222,6 @@ async function pushScrollbackLines(): Promise<void> {
 }
 
 async function pushAllDaemonSettings(): Promise<void> {
-    await pushVerboseStdioLog();
     await pushScrollbackLines();
 }
 
@@ -654,9 +642,6 @@ export function activate(ctx: vscode.ExtensionContext): void {
                 log(`config: pushing scrollbackLines=${lines}`);
                 await oneShot(daemonScriptPath(), { type: 'set_scrollback_lines', lines }, () => true, 500);
             }
-            if (e.affectsConfiguration('dterm.verboseStdioLog')) {
-                await pushVerboseStdioLog();
-            }
         }),
     );
 
@@ -787,75 +772,6 @@ export function activate(ctx: vscode.ExtensionContext): void {
             ch.appendLine(`daemon log: ${daemonLogPath()}`);
             ch.appendLine('---');
             ch.show(true);
-        }),
-    );
-
-    ctx.subscriptions.push(
-        vscode.commands.registerCommand('dterm.installClaudeWrapper', async () => {
-            const wrapperPath = path.join(ctx.extensionPath, 'out', 'dterm-wrapper');
-            try {
-                fs.chmodSync(wrapperPath, 0o755);
-            } catch (e) {
-                vscode.window.showErrorMessage(`dterm: cannot chmod wrapper at ${wrapperPath}: ${(e as Error).message}`);
-                return;
-            }
-            const hasWorkspace = (vscode.workspace.workspaceFolders ?? []).length > 0;
-            const target = hasWorkspace
-                ? vscode.ConfigurationTarget.Workspace
-                : vscode.ConfigurationTarget.Global;
-            const scopeLabel = hasWorkspace
-                ? `this workspace${vscode.env.remoteName ? ` (remote: ${vscode.env.remoteName})` : ''}`
-                : 'global user settings';
-            const cfg = vscode.workspace.getConfiguration('claudeCode');
-            const inspect = cfg.inspect<string>('claudeProcessWrapper');
-            const currentInScope = hasWorkspace
-                ? inspect?.workspaceValue
-                : inspect?.globalValue;
-            if (currentInScope === wrapperPath) {
-                vscode.window.showInformationMessage(
-                    `dterm: already set as claudeProcessWrapper for ${scopeLabel}.`,
-                );
-                return;
-            }
-            const action = currentInScope
-                ? await vscode.window.showWarningMessage(
-                      `dterm: claudeCode.claudeProcessWrapper for ${scopeLabel} is currently "${currentInScope}". Overwrite with "${wrapperPath}"?`,
-                      'Overwrite',
-                      'Cancel',
-                  )
-                : 'Overwrite';
-            if (action !== 'Overwrite') return;
-            await cfg.update('claudeProcessWrapper', wrapperPath, target);
-            vscode.window.showInformationMessage(
-                `dterm: installed as claudeProcessWrapper for ${scopeLabel}. Reload the Claude Code extension for it to take effect.`,
-            );
-        }),
-    );
-
-    ctx.subscriptions.push(
-        vscode.commands.registerCommand('dterm.uninstallClaudeWrapper', async () => {
-            const cfg = vscode.workspace.getConfiguration('claudeCode');
-            const inspect = cfg.inspect<string>('claudeProcessWrapper');
-            const hasWorkspace = (vscode.workspace.workspaceFolders ?? []).length > 0;
-            const target = hasWorkspace
-                ? vscode.ConfigurationTarget.Workspace
-                : vscode.ConfigurationTarget.Global;
-            const scopeLabel = hasWorkspace
-                ? `this workspace${vscode.env.remoteName ? ` (remote: ${vscode.env.remoteName})` : ''}`
-                : 'global user settings';
-            const currentInScope = hasWorkspace
-                ? inspect?.workspaceValue
-                : inspect?.globalValue;
-            if (!currentInScope) {
-                vscode.window.showInformationMessage(
-                    `dterm: claudeProcessWrapper is already unset for ${scopeLabel}.`,
-                );
-                return;
-            }
-            await cfg.update('claudeProcessWrapper', undefined, target);
-            vscode.window.showInformationMessage(
-                `dterm: cleared claudeProcessWrapper for ${scopeLabel} (was "${currentInScope}").`,
-            );
         }),
     );
 
