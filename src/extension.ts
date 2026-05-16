@@ -444,11 +444,11 @@ async function reconnectAll(
         vscode.window.terminals.map(sessionNameOf).filter((n): n is string => Boolean(n)),
     );
     const cwd = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
-    // Sort so editor-area sessions create in their stored (viewColumn, tabIndex)
-    // order — VS Code appends new terminals at the end of the target group, so
-    // creation order is what preserves relative position within each column.
-    // Panel sessions (no location) sort by name and end up last; their order in
-    // the panel tab strip isn't directly controllable.
+    // Panel sessions first so we can pop the panel via .show(true) on the
+    // first one as soon as it exists, rather than waiting for the full loop.
+    // Editor-area sessions follow, sorted by (viewColumn, tabIndex) — VS Code
+    // appends new terminals at the end of the target group, so creation order
+    // preserves relative position within each column.
     const sortedOurs = ours.slice().sort((a, b) => {
         const la = live.locations[a];
         const lb = live.locations[b];
@@ -456,11 +456,11 @@ async function reconnectAll(
             if (la.viewColumn !== lb.viewColumn) return la.viewColumn - lb.viewColumn;
             return la.tabIndex - lb.tabIndex;
         }
-        if (la) return -1;
-        if (lb) return 1;
+        if (la) return 1;
+        if (lb) return -1;
         return a.localeCompare(b);
     });
-    let lastAttached: vscode.Terminal | undefined;
+    let panelShown = false;
     for (const name of sortedOurs) {
         if (alreadyOpen.has(name)) {
             const t = vscode.window.terminals.find(t => sessionNameOf(t) === name);
@@ -471,17 +471,21 @@ async function reconnectAll(
             } else {
                 log(`reconnectAll: already open but not ready: ${name}`);
             }
-            if (t) lastAttached = t;
+            if (t && !panelShown && !live.locations[name]) {
+                // preserveFocus avoids stealing focus from the active editor.
+                t.show(true);
+                panelShown = true;
+            }
             continue;
         }
         const loc = live.locations[name];
         log(`reconnectAll: creating terminal for ${name} (${loc ? `col ${loc.viewColumn} idx ${loc.tabIndex}` : 'panel'})`);
-        lastAttached = vscode.window.createTerminal(buildOptions(name, cwd, live.labels[name], loc?.viewColumn));
+        const t = vscode.window.createTerminal(buildOptions(name, cwd, live.labels[name], loc?.viewColumn));
+        if (!panelShown && !loc) {
+            t.show(true);
+            panelShown = true;
+        }
     }
-    // Reveal the terminal panel if it was hidden (e.g., because the user has
-    // terminal.integrated.hideOnStartup set to "whenEmpty"). preserveFocus
-    // avoids stealing focus from whatever the user is currently doing.
-    if (lastAttached) lastAttached.show(true);
 }
 
 async function probeNodePty(ctx: vscode.ExtensionContext): Promise<{ ok: boolean; message: string }> {
