@@ -42,10 +42,6 @@
         "title": "dterm: Resync active terminal"
       },
       {
-        "command": "dterm.killSession",
-        "title": "dterm: Kill the active terminal's session"
-      },
-      {
         "command": "dterm.listSessions",
         "title": "dterm: List sessions"
       },

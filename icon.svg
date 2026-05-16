@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128">
+  <rect width="128" height="128" rx="22" fill="#1e1e1e"/>
+  <rect x="14" y="22" width="100" height="84" rx="8" fill="#0c0c0c" stroke="#2dd4bf" stroke-width="2.5"/>
+  <g font-family="ui-monospace, 'SF Mono', Menlo, monospace" font-weight="700" fill="#2dd4bf">
+    <text x="28" y="74" font-size="38">&gt;_</text>
+  </g>
+  <g stroke="#2dd4bf" stroke-width="3.5" fill="none" stroke-linecap="round">
+    <path d="M 78 60 a 8 8 0 0 1 0 -16 l 6 0"/>
+    <path d="M 90 44 a 8 8 0 0 1 0 16 l -6 0"/>
+  </g>
+</svg>

@@ -333,7 +333,12 @@ function buildOptions(
         name: label ?? defaultLabelFor(sessionName),
         pty,
         isTransient: true,
-        iconPath: new vscode.ThemeIcon('plug'),
+        iconPath: activeCtx
+            ? {
+                  light: vscode.Uri.joinPath(activeCtx.extensionUri, 'icons', 'dterm-tab-light.svg'),
+                  dark: vscode.Uri.joinPath(activeCtx.extensionUri, 'icons', 'dterm-tab-dark.svg'),
+              }
+            : new vscode.ThemeIcon('plug'),
         color: new vscode.ThemeColor('terminal.ansiCyan'),
         location: viewColumn !== undefined ? { viewColumn } : undefined,
     };
@@ -689,24 +694,6 @@ export function activate(ctx: vscode.ExtensionContext): void {
             }
             log(`resyncActive: ${pty.sessionName}`);
             pty.resync();
-        }),
-    );
-
-    ctx.subscriptions.push(
-        vscode.commands.registerCommand('dterm.killSession', async () => {
-            const t = vscode.window.activeTerminal;
-            const name = t ? sessionNameOf(t) : undefined;
-            if (!name) {
-                vscode.window.showInformationMessage('dterm: active terminal is not a dterm session.');
-                return;
-            }
-            const ok = await daemonKill(name);
-            pushedLabels.delete(name);
-            pushedLocations.delete(name);
-            t?.dispose();
-            vscode.window.showInformationMessage(
-                ok ? `dterm: killed ${name}.` : `dterm: kill request sent for ${name}.`,
-            );
         }),
     );
 
