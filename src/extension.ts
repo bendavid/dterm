@@ -13,13 +13,6 @@ const PROFILE_ID = 'dterm.profile';
 let activeCtx: vscode.ExtensionContext | undefined;
 let logChannel: vscode.OutputChannel | undefined;
 let pollTimer: NodeJS.Timeout | undefined;
-// True from the start of activate() until shortly after reconnectAll finishes.
-// VS Code's workspace restoration calls provideTerminalProfile during this
-// window to revive dterm-profile terminals it remembers; since reconnectAll
-// already recreates them, we suppress those calls to avoid one extra terminal
-// per workspace open.
-let activationInFlight = false;
-const AUTO_REVIVE_GRACE_MS = 3000;
 const pendingPushes = new Set<Promise<unknown>>();
 const pendingFocus = new Set<string>();
 // Tracks the last label value we pushed to the daemon for each session, so
@@ -467,6 +460,7 @@ async function reconnectAll(
         if (lb) return 1;
         return a.localeCompare(b);
     });
+    let lastAttached: vscode.Terminal | undefined;
     for (const name of sortedOurs) {
         if (alreadyOpen.has(name)) {
             const t = vscode.window.terminals.find(t => sessionNameOf(t) === name);
@@ -477,12 +471,17 @@ async function reconnectAll(
             } else {
                 log(`reconnectAll: already open but not ready: ${name}`);
             }
+            if (t) lastAttached = t;
             continue;
         }
         const loc = live.locations[name];
         log(`reconnectAll: creating terminal for ${name} (${loc ? `col ${loc.viewColumn} idx ${loc.tabIndex}` : 'panel'})`);
-        vscode.window.createTerminal(buildOptions(name, cwd, live.labels[name], loc?.viewColumn));
+        lastAttached = vscode.window.createTerminal(buildOptions(name, cwd, live.labels[name], loc?.viewColumn));
     }
+    // Reveal the terminal panel if it was hidden (e.g., because the user has
+    // terminal.integrated.hideOnStartup set to "whenEmpty"). preserveFocus
+    // avoids stealing focus from whatever the user is currently doing.
+    if (lastAttached) lastAttached.show(true);
 }
 
 async function probeNodePty(ctx: vscode.ExtensionContext): Promise<{ ok: boolean; message: string }> {
@@ -571,21 +570,11 @@ async function ensureNodePty(ctx: vscode.ExtensionContext): Promise<boolean> {
 
 export function activate(ctx: vscode.ExtensionContext): void {
     activeCtx = ctx;
-    activationInFlight = true;
     void ensureNodePty(ctx);
 
     ctx.subscriptions.push(
         vscode.window.registerTerminalProfileProvider(PROFILE_ID, {
             async provideTerminalProfile() {
-                const cfg = vscode.workspace.getConfiguration('dterm');
-                if (
-                    activationInFlight &&
-                    cfg.get<boolean>('autoReconnect', true) &&
-                    cfg.get<boolean>('suppressAutoRevive', true)
-                ) {
-                    log('profile: suppressing call during activation window (auto-revive)');
-                    return undefined;
-                }
                 const cwd = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
                 const name = await allocateSessionName();
                 if (!name) {
@@ -820,14 +809,10 @@ export function activate(ctx: vscode.ExtensionContext): void {
     );
 
     void (async () => {
-        try {
-            const { restarted } = await checkDaemonVersion(ctx);
-            if (restarted) return;
-            if (vscode.workspace.getConfiguration('dterm').get<boolean>('autoReconnect', true)) {
-                await reconnectAll(ctx);
-            }
-        } finally {
-            setTimeout(() => { activationInFlight = false; }, AUTO_REVIVE_GRACE_MS);
+        const { restarted } = await checkDaemonVersion(ctx);
+        if (restarted) return;
+        if (vscode.workspace.getConfiguration('dterm').get<boolean>('autoReconnect', true)) {
+            await reconnectAll(ctx);
         }
     })();
 }
