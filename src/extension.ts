@@ -306,12 +306,17 @@ interface ManagedSocket {
 
 // VS Code-managed Unix sockets that go stale across server restarts / client
 // reconnects. We expose a per-workspace symlink path to the shell and re-point
-// it whenever the upstream value in process.env changes — running shells keep
-// the same SSH_AUTH_SOCK / VSCODE_IPC_HOOK_CLI / VSCODE_GIT_IPC_HANDLE in their
-// env but transparently start using the new target on the next connect().
+// it whenever the upstream value in process.env changes -- running shells keep
+// the same env values but transparently start using the new target on the
+// next connect().
+//
+// SSH_AUTH_SOCK is standard SSH agent forwarding; VSCODE_GIT_IPC_HANDLE is
+// the askpass/credential IPC the git extension exports into terminals. We
+// don't track VSCODE_IPC_HOOK_CLI -- VS Code doesn't actually inject it into
+// standard terminals (the `code` CLI uses its own discovery), so our override
+// here was always a no-op.
 const MANAGED_SOCKETS: ManagedSocket[] = [
     { envVar: 'SSH_AUTH_SOCK',         linkName: 'ssh-auth.sock' },
-    { envVar: 'VSCODE_IPC_HOOK_CLI',   linkName: 'vscode-ipc.sock' },
     { envVar: 'VSCODE_GIT_IPC_HANDLE', linkName: 'vscode-git-ipc.sock' },
 ];
 
