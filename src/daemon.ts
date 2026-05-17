@@ -78,8 +78,6 @@ interface Client {
 }
 
 const sessions = new Map<string, Session>();
-const sessionLabels = new Map<string, string>();
-const sessionLocations = new Map<string, { viewColumn: number; tabIndex: number }>();
 const clients = new Set<Client>();
 let scrollbackLinesCap = DEFAULT_SCROLLBACK_LINES;
 let idleTimer: NodeJS.Timeout | undefined;
@@ -208,8 +206,6 @@ function createSession(
         }
         session.clients.clear();
         sessions.delete(name);
-        sessionLabels.delete(name);
-        sessionLocations.delete(name);
         try { session.emulator.dispose(); } catch { /* ignore */ }
         scheduleIdleExit();
     });
@@ -287,16 +283,7 @@ function handleMessage(client: Client, msg: ClientMessage) {
         }
         case 'list': {
             const names = [...sessions.keys()];
-            const nameSet = new Set(names);
-            const labels: Record<string, string> = {};
-            for (const [name, label] of sessionLabels) {
-                if (nameSet.has(name)) labels[name] = label;
-            }
-            const locations: Record<string, { viewColumn: number; tabIndex: number }> = {};
-            for (const [name, loc] of sessionLocations) {
-                if (nameSet.has(name)) locations[name] = loc;
-            }
-            send(client, { type: 'list_response', names, labels, locations });
+            send(client, { type: 'list_response', names });
             return;
         }
         case 'kill': {
@@ -320,33 +307,6 @@ function handleMessage(client: Client, msg: ClientMessage) {
             for (const s of sessions.values()) {
                 s.linesCap = n;
                 try { s.emulator.options.scrollback = n; } catch (e) { log('scrollback resize failed', s.name, e); }
-            }
-            return;
-        }
-        case 'set_label': {
-            if (msg.label === undefined || msg.label === '') {
-                if (sessionLabels.delete(msg.name)) {
-                    log('label cleared', msg.name);
-                }
-            } else {
-                if (sessionLabels.get(msg.name) !== msg.label) {
-                    sessionLabels.set(msg.name, msg.label);
-                    log('label set', msg.name, '=', msg.label);
-                }
-            }
-            return;
-        }
-        case 'set_location': {
-            if (msg.viewColumn === undefined || msg.tabIndex === undefined) {
-                if (sessionLocations.delete(msg.name)) {
-                    log('location cleared', msg.name);
-                }
-            } else {
-                const prev = sessionLocations.get(msg.name);
-                if (!prev || prev.viewColumn !== msg.viewColumn || prev.tabIndex !== msg.tabIndex) {
-                    sessionLocations.set(msg.name, { viewColumn: msg.viewColumn, tabIndex: msg.tabIndex });
-                    log('location set', msg.name, '= col', msg.viewColumn, 'idx', msg.tabIndex);
-                }
             }
             return;
         }

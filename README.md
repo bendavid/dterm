@@ -13,9 +13,11 @@ Unlike VS Code's built-in terminal persistence, dterm sessions survive VS Code S
 - **Persistent shells.** Live processes, working directories, and scrollback all preserved across reloads, restarts, and reconnects.
 - **Per-workspace scope.** Sessions are tagged with a hash of the workspace folder path; each workspace has an independent session pool.
 - **Multi-client.** Multiple VS Code clients can attach to the same daemon and see the same sessions concurrently (e.g., one window per monitor on the same dev container, or a fresh client reattaching while another is still connected).
-- **Editor-area placement preserved.** If you moved a terminal to the editor area, it comes back there on next open. Column and tab-order within a column are remembered.
-- **Custom labels persist.** Right-click → Rename. The label survives reattach.
+- **Editor-area placement preserved.** If you moved a terminal to the editor area, it comes back there on next open. Column and tab-order within a column are remembered, scoped per-client (different laptops connecting to the same remote keep independent layouts, matching VS Code's own per-laptop terminal layout behavior).
+- **Custom labels persist.** Right-click → Rename. The label survives reattach (also per-client scoped).
 - **Fresh sockets on reattach.** `SSH_AUTH_SOCK`, `VSCODE_IPC_HOOK_CLI`, and `VSCODE_GIT_IPC_HANDLE` are indirected through workspace-scoped symlinks, so reattached terminals always see the *current* VS Code host's sockets, not stale ones from a prior session.
+- **VS Code shell integration.** dterm terminals are launched via a small stub that VS Code treats as a real shell binary (bash, zsh, or fish), so all of VS Code's automatic shell-integration injection applies: command decorations, command navigation (`Ctrl/Cmd+Up/Down`), recent commands, accurate CWD reporting. Integration persists naturally across reattach — the daemon's shell process keeps running with the scripts already loaded; reattaching just starts a new stub that bridges stdio.
+- **Extension-contributed env propagates correctly.** Because the stub is launched by VS Code's normal terminal path, env vars contributed by other extensions (Claude Code's `CLAUDE_CODE_SSE_PORT`, the git extension's `VSCODE_GIT_*`, Python venv activations, etc.) reach the shell automatically — no probe or extra plumbing needed.
 
 ## Usage
 
