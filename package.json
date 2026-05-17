@@ -50,6 +50,10 @@
         "title": "dterm: Show daemon log"
       },
       {
+        "command": "dterm.showExtensionLog",
+        "title": "dterm: Show extension log"
+      },
+      {
         "command": "dterm.showDiagnostics",
         "title": "dterm: Show diagnostics"
       },

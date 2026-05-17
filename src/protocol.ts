@@ -1,9 +1,15 @@
 export type ClientMessage =
     | {
+          // For a brand-new session (no existing daemon-side session with this
+          // name), cols/rows are required -- they size the freshly spawned pty.
+          // For a reattach, cols/rows are optional: if omitted, the daemon keeps
+          // the session's existing dimensions and the client follows up with a
+          // `resize` once it knows VS Code's real layout dimensions (which only
+          // arrive via Pseudoterminal.open()'s initialDimensions argument).
           type: 'open';
           name: string;
-          cols: number;
-          rows: number;
+          cols?: number;
+          rows?: number;
           cwd?: string;
           env?: Record<string, string>;
           shell?: string;
