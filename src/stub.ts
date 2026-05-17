@@ -1,24 +1,21 @@
 #!/usr/bin/env node
-// dterm stub — bridges a VS Code-launched real terminal to the dterm daemon.
+// dterm bootstrap stub.
 //
-// VS Code launches this binary via the `shellPath` of a terminal profile or
-// configured profile. To get VS Code's shell-integration injection (which is
-// keyed off the basename of shellPath), the stub is symlinked as `bash`,
-// `zsh`, `fish` etc. inside `out/shims/`. VS Code recognizes the basename,
-// injects `--init-file` / `ZDOTDIR` / `VSCODE_INJECTION` for that shell, and
-// hands the resulting env and args to the stub.
+// Spawned by the extension as a hidden real terminal (hideFromUser: true) for
+// the sole purpose of capturing VS Code's automatic shell-integration env
+// injection (--init-file path, VSCODE_INJECTION, VSCODE_SHELL_INTEGRATION_*,
+// etc.) and handing it to the dterm daemon, which spawns the actual shell.
+// The stub does NOT bridge stdio for the user-facing terminal -- a
+// Pseudoterminal in the extension owns that, connecting to the daemon
+// directly.
 //
-// The stub then:
-//   - Connects to the dterm daemon (spawning it via double-fork if absent).
-//   - Opens or attaches a session named via DTERM_SESSION env.
-//   - Forwards stdin -> daemon, daemon output -> stdout.
-//   - Tracks resize events and forwards them.
-//   - Exits when the session ends or the socket disconnects.
-//
-// The shell that actually runs is launched daemon-side from the env+args the
-// stub forwarded. `--init-file <vscode-integration>` therefore gets honored
-// by the real shell, and VS Code's shell-integration sequences flow back
-// through the daemon's pty -> socket -> stub stdout -> xterm.js.
+// Lifecycle:
+//   1. Connect to daemon socket (double-fork-spawn the daemon if absent).
+//   2. Send `open` with env, shell, args.
+//   3. Wait for `opened` ack from daemon.
+//   4. Exit cleanly. The hidden VS Code terminal closes, extension's
+//      onDidCloseTerminal listener observes our exit code and proceeds with
+//      the Pseudoterminal connection.
 
 import * as cp from 'child_process';
 import * as fs from 'fs';
@@ -51,22 +48,6 @@ function shellBasename(): string {
     return path.basename(process.argv[1] || 'bash');
 }
 
-const FG_NAME_MARKER = '\u200B';
-const FG_NAME_MAX_BYTES = 15 - Buffer.byteLength(FG_NAME_MARKER);  // TASK_COMM_LEN - null - marker
-
-function setForegroundName(name: string): void {
-    // Append U+200B so the extension can distinguish this daemon-driven name
-    // (ephemeral, follows the foreground process) from a user-typed rename
-    // (TitleEventSource.Api, persistable). Trim by byte length so the kernel's
-    // TASK_COMM_LEN truncation can't clip the marker on a multi-byte name.
-    let safe = name.replace(/[\x00-\x1f\x7f]/g, '');
-    while (Buffer.byteLength(safe) > FG_NAME_MAX_BYTES) {
-        safe = safe.slice(0, -1);
-    }
-    if (safe.length === 0) return;
-    process.title = `${safe}${FG_NAME_MARKER}`;
-}
-
 function resolveShellBinary(name: string): string {
     // The stub was invoked via a symlink whose basename mimics the shell.
     // The real binary needs to be on PATH. Prefer explicit override.
@@ -84,7 +65,6 @@ function resolveShellBinary(name: string): string {
 
 function spawnDaemonDetached(): void {
     // Double-fork: spawn an intermediate node that spawns the daemon and exits.
-    // Same approach as the extension-side client uses.
     const logPath = path.join(os.tmpdir(), `dterm-${userTag()}.log`);
     const daemon = daemonScriptPath();
     const exe = process.execPath;
@@ -141,82 +121,33 @@ async function main(): Promise<void> {
         process.exit(2);
     }
 
-    // Drive the tab title via /proc/<pid>/comm. VS Code's default
-    // terminal.integrated.tabs.title template is "${process}", which resolves
-    // to _processName -- fed by node-pty polling ptyProcess.process every 200ms,
-    // which on Linux reads /proc/<pid>/comm, which Node's process.title updates
-    // via prctl(PR_SET_NAME). OSC 0/2 sequences from the pty don't help because
-    // they land in _sequence, which the default template ignores.
-    setForegroundName(shellBasename());
-
-    // VS Code's bash/zsh integration scripts emit OSC 633 ; P ; HasRichCommandDetection=True
-    // once at script-load time, which upgrades the tab tooltip from "basic" to
-    // "rich". On reattach the script is already loaded and won't re-emit, so
-    // the new TerminalInstance stays at "basic". Re-inject the property now.
-    // (Doing it before any prompt-start sequence is fine: the property emit
-    // already happens at script load -- i.e., before the first prompt -- in the
-    // working new-terminal case.) For shells without integration the property
-    // is harmless: VS Code only surfaces "rich" once a CommandDetection-bearing
-    // OSC 633 ; A also arrives.
-    process.stdout.write('\x1b]633;P;HasRichCommandDetection=True\x07');
-
     const sock = await connectWithRetry();
     const stream = new LineStream<DaemonMessage>();
 
-    let exitCode = 0;
-    let exited = false;
-    const exit = (code: number): never => {
-        if (!exited) {
-            exited = true;
-            exitCode = code;
+    let settled = false;
+    const finish = (code: number): never => {
+        if (!settled) {
+            settled = true;
+            try { sock.end(); } catch { /* already gone */ }
         }
-        process.exit(exitCode);
+        process.exit(code);
     };
 
     sock.on('data', (chunk: Buffer) => {
         for (const m of stream.feed(chunk)) {
-            switch (m.type) {
-                case 'output': {
-                    // Daemon ships pty output as base64 (binary-safe).
-                    process.stdout.write(Buffer.from(m.data, 'base64'));
-                    break;
-                }
-                case 'process_name':
-                    // Propagate the daemon's foreground-process tracking into our
-                    // own process.title so VS Code's 200ms ptyProcess.process poll
-                    // picks it up and updates the tab title.
-                    setForegroundName(m.name);
-                    break;
-                case 'session_end':
-                    exit(m.exitCode ?? 0);
-                    break;
-                case 'error':
-                    process.stderr.write(`dterm-stub: ${m.message}\n`);
-                    break;
-                // 'opened' is informational, ignored.
+            if (m.type === 'opened') {
+                finish(0);
+            } else if (m.type === 'error') {
+                process.stderr.write(`dterm-stub: ${m.message}\n`);
+                finish(1);
             }
+            // Other message types are not interesting to the bootstrap stub.
         }
     });
-    sock.on('close', () => exit(exitCode));
+    sock.on('close', () => finish(settled ? 0 : 1));
     sock.on('error', e => {
         process.stderr.write(`dterm-stub: socket: ${e.message}\n`);
-        exit(1);
-    });
-
-    // Stdio passthrough. xterm.js handles line discipline on the VS Code side
-    // and the real shell's pty handles it on the daemon side; the outer pty
-    // VS Code gave us should be transparent. setRawMode kills echo/canonical
-    // mode in case the runtime defaults bit us.
-    process.stdin.setRawMode?.(true);
-    process.stdin.on('data', (chunk: Buffer) => {
-        sock.write(encode({ type: 'input', data: chunk.toString('base64') }));
-    });
-    process.stdin.on('end', () => exit(exitCode));
-
-    process.stdout.on('resize', () => {
-        const cols = process.stdout.columns || 80;
-        const rows = process.stdout.rows || 24;
-        sock.write(encode({ type: 'resize', cols, rows }));
+        finish(1);
     });
 
     const shellName = shellBasename();
@@ -232,6 +163,16 @@ async function main(): Promise<void> {
         shell: shellBinary,
         shellArgs: process.argv.slice(2),
     }));
+
+    // Safety: bound the wait. If the daemon never acks, drop the hidden
+    // terminal so the extension's onDidCloseTerminal hook fires with a
+    // non-zero exit code.
+    setTimeout(() => {
+        if (!settled) {
+            process.stderr.write('dterm-stub: daemon opened-ack timeout\n');
+            finish(1);
+        }
+    }, 5000);
 }
 
 main().catch(e => {

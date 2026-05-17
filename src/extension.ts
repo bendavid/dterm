@@ -3,9 +3,11 @@ import * as path from 'path';
 import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as cp from 'child_process';
+import * as net from 'net';
 import * as os from 'os';
 import { oneShot, readDaemonLogTail, isDaemonAlive } from './client';
 import { agentDir, daemonLogPath, socketPath } from './paths';
+import { encode, LineStream, type ClientMessage, type DaemonMessage } from './protocol';
 
 const PROFILE_ID = 'dterm.profile';
 
@@ -14,18 +16,39 @@ let logChannel: vscode.OutputChannel | undefined;
 let pollTimer: NodeJS.Timeout | undefined;
 const pendingFocus = new Set<string>();
 
-// Per-session UI metadata (label, editor-area location). Stored in workspaceState
-// under a client-specific key derived from vscode.env.machineId so two laptops
-// connecting to the same remote get independent layouts — matching how VS Code's
-// built-in terminal layout is local-to-client.
+// Per-session UI metadata (label, editor-area location, panel order). Stored
+// in workspaceState under a client-specific key derived from vscode.env.machineId
+// so two laptops connecting to the same remote get independent layouts --
+// matching how VS Code's built-in terminal layout is local-to-client.
 interface SessionMeta {
     label?: string;
     viewColumn?: number;
     tabIndex?: number;
+    // Position among panel dterm terminals (0 = first). Undefined for editor-area
+    // sessions. Used to restore creation order so panel tabs appear as the user
+    // arranged them, not alphabetical by session name.
+    panelIndex?: number;
 }
 
 function metaKey(sessionName: string): string {
     return `client.${vscode.env.machineId}.session.${sessionName}`;
+}
+
+// Separate key for the focused-terminal session. Not per-session because at most
+// one terminal is active at a time; storing as a flat key avoids churn-y meta
+// updates across every session.
+function activeKey(): string {
+    return `client.${vscode.env.machineId}.active`;
+}
+
+function getActive(): string | undefined {
+    if (!activeCtx) return undefined;
+    return activeCtx.workspaceState.get<string>(activeKey());
+}
+
+async function setActive(sessionName: string | undefined): Promise<void> {
+    if (!activeCtx) return;
+    await activeCtx.workspaceState.update(activeKey(), sessionName);
 }
 
 function getMeta(sessionName: string): SessionMeta | undefined {
@@ -35,49 +58,63 @@ function getMeta(sessionName: string): SessionMeta | undefined {
 
 async function setMeta(sessionName: string, meta: SessionMeta | undefined): Promise<void> {
     if (!activeCtx) return;
-    const empty = !meta || (meta.label === undefined && meta.viewColumn === undefined);
+    const empty = !meta || (
+        meta.label === undefined
+        && meta.viewColumn === undefined
+        && meta.panelIndex === undefined
+    );
     await activeCtx.workspaceState.update(metaKey(sessionName), empty ? undefined : meta);
 }
 
 function metaEqual(a: SessionMeta | undefined, b: SessionMeta | undefined): boolean {
     return (a?.label === b?.label)
         && (a?.viewColumn === b?.viewColumn)
-        && (a?.tabIndex === b?.tabIndex);
+        && (a?.tabIndex === b?.tabIndex)
+        && (a?.panelIndex === b?.panelIndex);
 }
 
 function log(line: string): void {
     if (logChannel) logChannel.appendLine(`[${new Date().toISOString()}] ${line}`);
 }
 
-// The stub appends U+200B to process.title for every daemon-driven foreground
-// name change. node-pty propagates that into _processName, which feeds the
-// ${process} tab template, which surfaces as t.name. The marker is the only
-// way to tell those ephemeral updates apart from user renames -- VS Code
-// exposes no rename event and the two arrive through the same property.
-//
-// The same marker is also baked into /proc/<pid>/comm at exec time via a
-// `node\u200B` symlink invoked from the stub's shebang (see ensureNodeShim), so
-// the marker is present from the very first node-pty poll -- no startup race.
-const FG_NAME_MARKER = '\u200B';
+// Terminals dterm owns are Pseudoterminal-backed (extension-controlled stdio).
+// vscode.Terminal's creationOptions for ExtensionTerminalOptions doesn't carry
+// the env we used to encode the session name into, so we maintain side maps.
+// terminalToSession is queried by all the snapshot/disposal handlers; the
+// reverse map ptyBySession is used to update name-lock state when we detect
+// user renames during polling.
+const terminalToSession = new WeakMap<vscode.Terminal, string>();
+const ptyBySession = new Map<string, DtermPseudoterminal>();
 
-function snapshotLabels(): void {
+function snapshotLabels(): Promise<void> {
+    const writes: Promise<void>[] = [];
     for (const t of vscode.window.terminals) {
         const sName = sessionNameOf(t);
         if (!sName) continue;
-        // Marker-tagged names are always daemon-driven (from process.title or
-        // the shebang trick at startup) -- skip. Bare names mean either a user
-        // rename or a restored terminal whose TerminalOptions.name locked in
-        // Api-source title (which bypasses the template, so the marker can't
-        // appear). Both should be persisted as labels.
-        if (t.name.endsWith(FG_NAME_MARKER)) continue;
+        const pty = ptyBySession.get(sName);
+        if (!pty) continue;
         const current = getMeta(sName);
+        // Inline tab rename to empty resolves t.name to '' for Pseudoterminals
+        // (because _processName -- the empty-rename fallback -- stays empty
+        // for extension-controlled terminals). Treat that as "user cleared
+        // the label": unlock the Pseudoterminal so daemon process_name updates
+        // drive the tab name again, and drop any saved label.
+        if (t.name === '') {
+            pty.unlockName();
+            if (current?.label !== undefined) {
+                writes.push(setMeta(sName, { ...current, label: undefined }));
+            }
+            continue;
+        }
+        if (!pty.detectAndLockUserRename()) continue;
         if (current?.label !== t.name) {
-            void setMeta(sName, { ...current, label: t.name });
+            writes.push(setMeta(sName, { ...current, label: t.name }));
         }
     }
+    return Promise.all(writes).then(() => undefined);
 }
 
-function snapshotLocations(): void {
+function snapshotLocations(): Promise<void> {
     // Find editor-area terminals via tabGroups. Terminals in the panel are absent
     // from tabGroups entirely and end up with viewColumn=undefined.
     const inEditor = new Map<string, { viewColumn: number; tabIndex: number }>();
@@ -95,6 +132,20 @@ function snapshotLocations(): void {
             }
         }
     }
+    // Walk vscode.window.terminals in order; it reflects creation order plus
+    // any user drag-reorder in the panel. Assign panelIndex to each dterm
+    // panel terminal (those not in inEditor) in encounter order. Non-dterm
+    // terminals interleave but we filter them out, so panelIndex is dense
+    // within dterm-only order.
+    const panelOrder = new Map<string, number>();
+    let nextPanelIdx = 0;
+    for (const t of vscode.window.terminals) {
+        const sName = sessionNameOf(t);
+        if (!sName) continue;
+        if (inEditor.has(sName)) continue;
+        panelOrder.set(sName, nextPanelIdx++);
+    }
+    const writes: Promise<void>[] = [];
     for (const t of vscode.window.terminals) {
         const sName = sessionNameOf(t);
         if (!sName) continue;
@@ -104,11 +155,19 @@ function snapshotLocations(): void {
             ...current,
             viewColumn: target?.viewColumn,
             tabIndex: target?.tabIndex,
+            panelIndex: target ? undefined : panelOrder.get(sName),
         };
         if (!metaEqual(current, next)) {
-            void setMeta(sName, next);
+            writes.push(setMeta(sName, next));
         }
     }
+    // Active terminal -- a flat workspaceState key, not per-session.
+    const active = vscode.window.activeTerminal;
+    const activeName = active ? sessionNameOf(active) : undefined;
+    if (getActive() !== activeName) {
+        writes.push(setActive(activeName));
+    }
+    return Promise.all(writes).then(() => undefined);
 }
 
 function ensurePolling(): void {
@@ -120,8 +179,8 @@ function ensurePolling(): void {
             pollTimer = undefined;
             return;
         }
-        snapshotLabels();
-        snapshotLocations();
+        void snapshotLabels();
+        void snapshotLocations();
     }, 2000);
     pollTimer.unref?.();
 }
@@ -135,6 +194,12 @@ function pruneStaleMeta(liveSessionNames: Set<string>): void {
         if (!liveSessionNames.has(session)) {
             void activeCtx.workspaceState.update(key, undefined);
         }
+    }
+    // Drop the saved-active key too if it points at a dead session, so reattach
+    // doesn't try to focus a nonexistent terminal.
+    const active = getActive();
+    if (active && !liveSessionNames.has(active)) {
+        void setActive(undefined);
     }
 }
 
@@ -193,43 +258,6 @@ async function allocateSessionName(): Promise<string | undefined> {
 function daemonScriptPath(): string {
     if (!activeCtx) throw new Error('dterm: extension not activated');
     return path.join(activeCtx.extensionPath, 'out', 'daemon.js');
-}
-
-// Directory we prepend to the stub's PATH so /usr/bin/env can find `node​`.
-// Kept separate from out/shims (which holds bash/zsh/fish/dterm) so we don't
-// expose those shell shims on the user's shell PATH where they could shadow
-// the real bash/zsh/fish.
-function nodeShimDir(): string {
-    if (!activeCtx) throw new Error('dterm: extension not activated');
-    return path.join(activeCtx.extensionPath, 'out', 'nodeShim');
-}
-
-// Ensure out/nodeShim/node​ points at VS Code's current node. The stub's
-// shebang is `#!/usr/bin/env node​`, so /usr/bin/env will look up the
-// marker-tagged name in PATH; resolving it via this symlink makes the kernel
-// set /proc/<stub-pid>/comm to "node​" (basename of the path execve was
-// called with), which VS Code's 200ms node-pty poll picks up as the initial
-// _processName -- marker present from the very first tick.
-function ensureNodeShim(): void {
-    const dir = nodeShimDir();
-    const link = path.join(dir, 'node\u200B');
-    const target = process.execPath;
-    try {
-        fs.mkdirSync(dir, { recursive: true });
-    } catch (e) {
-        log(`nodeShim: mkdir failed: ${(e as Error).message}`);
-        return;
-    }
-    let current: string | undefined;
-    try { current = fs.readlinkSync(link); } catch { /* not there */ }
-    if (current === target) return;
-    try { fs.unlinkSync(link); } catch { /* not there */ }
-    try {
-        fs.symlinkSync(target, link);
-        log(`nodeShim: ${link} -> ${target}`);
-    } catch (e) {
-        log(`nodeShim: symlink failed: ${(e as Error).message}`);
-    }
 }
 
 async function pushScrollbackLines(): Promise<void> {
@@ -344,6 +372,228 @@ function refreshManagedSockets(): Record<string, string> {
 // unrecognized basename means VS Code skips injection entirely, and
 // DTERM_REAL_SHELL tells the stub which binary the daemon should actually
 // spawn.
+// Pseudoterminal that connects directly to the daemon over its Unix socket and
+// bridges stdio for the user-facing terminal. The bootstrap stub has already
+// captured shell-integration env and handed it to the daemon by the time we
+// instantiate; here we just attach as a client and forward.
+class DtermPseudoterminal implements vscode.Pseudoterminal {
+    private writeEmitter = new vscode.EventEmitter<string>();
+    private closeEmitter = new vscode.EventEmitter<number | void>();
+    private nameEmitter = new vscode.EventEmitter<string>();
+
+    onDidWrite = this.writeEmitter.event;
+    onDidClose = this.closeEmitter.event;
+    onDidChangeName = this.nameEmitter.event;
+
+    private sock: net.Socket | undefined;
+    private parser = new LineStream<DaemonMessage>();
+    private cols: number;
+    private rows: number;
+    private term: vscode.Terminal | undefined;
+    // Last name we pushed via onDidChangeName. If t.name diverges from this we
+    // know a user rename happened (VS Code exposes no rename event).
+    private lastFiredName: string | undefined;
+    // Locked once a user rename is observed (or once we restore a saved label).
+    // While locked, daemon process_name updates do not override the visible name.
+    private nameLocked: boolean;
+    // The latest foreground process name the daemon reported, regardless of
+    // whether the name is currently locked. Used to re-fire onDidChangeName
+    // immediately when unlocking, so the user doesn't have to wait for the
+    // next daemon process_name event for the tab to update.
+    private lastProcessNameSeen: string | undefined;
+    // Async-attach state. The visible terminal is shown immediately and
+    // bootstrap runs in parallel so the user sees a terminal in tens of ms
+    // instead of waiting for daemon+shell-integration setup. We can only
+    // connect after both VS Code has called open() and bootstrap has acked.
+    private opened = false;
+    private bootstrapDone = false;
+    private closed = false;
+    private inputQueue: string[] = [];
+    // Bootstrap error buffered until open() so the user actually sees it
+    // (writeEmitter.fire before VS Code has subscribed is dropped on the floor).
+    private pendingError: string | undefined;
+
+    constructor(
+        public readonly sessionName: string,
+        restoredLabel: string | undefined,
+        initialDims: { cols: number; rows: number },
+        bootstrapPromise: Promise<void>,
+    ) {
+        this.cols = initialDims.cols;
+        this.rows = initialDims.rows;
+        this.nameLocked = restoredLabel !== undefined;
+        this.lastFiredName = restoredLabel;
+        bootstrapPromise.then(
+            () => {
+                this.bootstrapDone = true;
+                this.tryConnect();
+            },
+            (e: Error) => {
+                this.pendingError = `dterm: failed to start shell: ${e.message}\r\n`;
+                if (this.opened) this.flushError();
+            },
+        );
+    }
+
+    private flushError(): void {
+        if (!this.pendingError) return;
+        this.writeEmitter.fire(this.pendingError);
+        this.pendingError = undefined;
+        this.closeEmitter.fire(1);
+    }
+
+    private tryConnect(): void {
+        if (this.closed || this.sock || !this.opened || !this.bootstrapDone) return;
+        void this.connect();
+    }
+
+    attachTerminal(t: vscode.Terminal): void {
+        this.term = t;
+    }
+
+    // Returns true and locks future auto-updates if t.name has diverged from
+    // the last value we fired (or from the restored label). Called from
+    // handleProcessName and from snapshotLabels' polling loop.
+    detectAndLockUserRename(): boolean {
+        if (this.nameLocked) return true;
+        if (!this.term) return false;
+        if (this.lastFiredName !== undefined && this.term.name !== this.lastFiredName) {
+            this.nameLocked = true;
+            return true;
+        }
+        return false;
+    }
+
+    open(initialDimensions: vscode.TerminalDimensions | undefined): void {
+        if (initialDimensions) {
+            this.cols = initialDimensions.columns;
+            this.rows = initialDimensions.rows;
+        }
+        this.opened = true;
+        if (this.pendingError) {
+            this.flushError();
+            return;
+        }
+        this.tryConnect();
+    }
+
+    private async connect(): Promise<void> {
+        try {
+            this.sock = await connectToDaemon();
+        } catch (e) {
+            this.writeEmitter.fire(`dterm: failed to connect to daemon: ${(e as Error).message}\r\n`);
+            this.closeEmitter.fire(1);
+            return;
+        }
+        this.sock.on('data', (chunk: Buffer) => this.handleData(chunk));
+        this.sock.on('close', () => this.closeEmitter.fire(0));
+        this.sock.on('error', e => {
+            this.writeEmitter.fire(`\r\ndterm: socket error: ${e.message}\r\n`);
+            this.closeEmitter.fire(1);
+        });
+        // Bootstrap already created/confirmed the session; just attach.
+        // env/shell/shellArgs/cwd are ignored by the daemon on existing sessions.
+        const msg: ClientMessage = {
+            type: 'open',
+            name: this.sessionName,
+            cols: this.cols,
+            rows: this.rows,
+        };
+        this.sock.write(encode(msg));
+        // Flush any input the user typed while waiting for connect.
+        if (this.inputQueue.length > 0) {
+            for (const data of this.inputQueue) {
+                this.sock.write(encode({
+                    type: 'input',
+                    data: Buffer.from(data, 'utf8').toString('base64'),
+                }));
+            }
+            this.inputQueue.length = 0;
+        }
+    }
+
+    private handleData(chunk: Buffer): void {
+        for (const m of this.parser.feed(chunk)) {
+            switch (m.type) {
+                case 'output':
+                    // Daemon ships pty output as base64 (binary-safe). xterm.js
+                    // accepts UTF-8 strings via writeEmitter.fire so we decode.
+                    // Includes the shell's own OSC sequences and any synthetic
+                    // OSC the daemon replays for late attaches (e.g., the
+                    // one-shot HasRichCommandDetection advertisement).
+                    this.writeEmitter.fire(Buffer.from(m.data, 'base64').toString('utf8'));
+                    break;
+                case 'process_name':
+                    this.handleProcessName(m.name);
+                    break;
+                case 'session_end':
+                    this.closeEmitter.fire(m.exitCode ?? 0);
+                    break;
+                case 'error':
+                    this.writeEmitter.fire(`\r\ndterm: ${m.message}\r\n`);
+                    break;
+            }
+        }
+    }
+
+    private handleProcessName(name: string): void {
+        this.lastProcessNameSeen = name;
+        if (this.detectAndLockUserRename()) return;
+        this.nameEmitter.fire(name);
+        this.lastFiredName = name;
+    }
+
+    // Re-enable dynamic process-name updates after a user clears their custom
+    // label (by inline-renaming to empty -- VS Code's only mechanism for this).
+    // Immediately re-fires the latest known process name so the tab updates
+    // without waiting for the next daemon event.
+    unlockName(): void {
+        this.nameLocked = false;
+        this.lastFiredName = undefined;
+        if (this.lastProcessNameSeen) {
+            this.nameEmitter.fire(this.lastProcessNameSeen);
+            this.lastFiredName = this.lastProcessNameSeen;
+        }
+    }
+
+    handleInput(data: string): void {
+        if (!this.sock?.writable) {
+            // Queue input typed during the bootstrap-then-connect window so
+            // we don't drop keystrokes from a user typing into a still-blank
+            // terminal. Flushed in connect() once the socket is up.
+            this.inputQueue.push(data);
+            return;
+        }
+        const buf = Buffer.from(data, 'utf8');
+        this.sock.write(encode({ type: 'input', data: buf.toString('base64') }));
+    }
+
+    setDimensions(dims: vscode.TerminalDimensions): void {
+        this.cols = dims.columns;
+        this.rows = dims.rows;
+        if (this.sock?.writable) {
+            this.sock.write(encode({ type: 'resize', cols: this.cols, rows: this.rows }));
+        }
+    }
+
+    close(): void {
+        this.closed = true;
+        if (this.sock) {
+            try { this.sock.write(encode({ type: 'detach' })); } catch { /* ignore */ }
+            try { this.sock.end(); } catch { /* ignore */ }
+            this.sock = undefined;
+        }
+    }
+}
+
+function connectToDaemon(): Promise<net.Socket> {
+    return new Promise((resolve, reject) => {
+        const s = net.createConnection(socketPath());
+        s.once('connect', () => resolve(s));
+        s.once('error', reject);
+    });
+}
+
 function stubPathForShell(shellBinary: string): { stubPath: string; shimName: string } {
     if (!activeCtx) throw new Error('dterm: extension not activated');
     const base = path.basename(shellBinary);
@@ -355,59 +605,62 @@ function stubPathForShell(shellBinary: string): { stubPath: string; shimName: st
     };
 }
 
-function buildOptions(
-    sessionName: string,
-    cwd?: string,
-    label?: string,
-    viewColumn?: number,
-): vscode.TerminalOptions {
+// Options for the hidden bootstrap stub: a real shell terminal whose only
+// purpose is to be spawned through VS Code's normal terminal pipeline so it
+// inherits shell-integration env injection (--init-file, VSCODE_INJECTION,
+// VSCODE_SHELL_INTEGRATION_NONCE, etc.). The stub forwards that env to the
+// daemon as part of `open`, daemon spawns the actual shell with it, then the
+// stub exits -- whereupon the visible Pseudoterminal takes over display.
+function buildBootstrapStubOptions(sessionName: string, cwd?: string): vscode.TerminalOptions {
     const cfg = shellConfig();
     const shellBinary = resolveShellBinary(cfg.shell);
     const { stubPath, shimName } = stubPathForShell(shellBinary);
     // Symlink overrides for managed sockets so reattached terminals continue
     // to see live SSH_AUTH_SOCK / VSCODE_IPC_HOOK_CLI / VSCODE_GIT_IPC_HANDLE.
-    // VS Code's env collections would otherwise put the literal current
-    // socket path into the stub's env, baking it into the running shell.
+    // VS Code's env collections would otherwise put the literal current socket
+    // path into the stub's env, baking it into the running shell.
     //
-    // PATH is prepended with nodeShimDir so /usr/bin/env in the stub's shebang
-    // resolves `node​` to our symlink -- which makes /proc/<stub-pid>/comm
-    // start out marker-tagged. The user's PATH is preserved as the tail.
-    //
-    // ELECTRON_RUN_AS_NODE makes process.execPath (typically VS Code's Electron
-    // binary on a local install) behave as plain Node. Real Node ignores the
-    // var, so this is safe on remote/server hosts where process.execPath is
-    // already a standalone node. The daemon strips it before spawning shells.
+    // ELECTRON_RUN_AS_NODE makes process.execPath (VS Code's Electron binary
+    // on a local install) behave as plain Node so the stub's shebang resolves.
+    // Real Node ignores the var, so this is safe on remote/server hosts where
+    // process.execPath is already standalone Node. The daemon strips it before
+    // spawning the user's shell.
     const env: { [key: string]: string } = {
         DTERM_SESSION: sessionName,
-        PATH: `${nodeShimDir()}:${process.env.PATH ?? ''}`,
         ELECTRON_RUN_AS_NODE: '1',
         ...refreshManagedSockets(),
     };
-    // If the shim basename doesn't match the actual shell (always true for
-    // the `dterm` fallback shim, and possibly true if user pointed `bash`
-    // shim at a custom bash build), tell the stub which real binary the
-    // daemon should spawn. Otherwise the stub falls back to PATH lookup.
     if (shimName === 'dterm' || path.basename(shellBinary) !== shimName) {
         env.DTERM_REAL_SHELL = shellBinary;
     }
     return {
-        // Only set name when restoring a user-defined label. Setting it via
-        // TerminalOptions makes the title TitleEventSource.Api, which makes
-        // _staticTitle sticky and bypasses the ${process} template -- so the
-        // stub's process.title updates would stop reaching the tab. Leaving
-        // it unset lets the template surface the daemon-tracked process name.
-        name: label,
+        name: `dterm-bootstrap:${sessionName}`,
         shellPath: stubPath,
         shellArgs: cfg.shellArgs,
         cwd,
         env,
-        // VS Code's persistence for editor-area terminals drops the launch
-        // config and falls back to default-profile on revival (see
-        // TerminalInputSerializer). For panel terminals persistence preserves
-        // launch config but adds no value over dterm's own restoration. Mark
-        // transient and let reconnectAll + workspaceState-stored metadata
-        // handle placement consistently for both cases.
+        hideFromUser: true,
         isTransient: true,
+    };
+}
+
+// Options for the visible Pseudoterminal-backed terminal that the user
+// interacts with. Connects directly to the daemon via a Unix socket and
+// forwards stdio. The bootstrap stub must have already returned a successful
+// `opened` ack from the daemon before this is created -- otherwise the
+// `open` message here would create a session without shell-integration env.
+function buildPseudoOptions(
+    sessionName: string,
+    label: string | undefined,
+    viewColumn: number | undefined,
+    initialDims: { cols: number; rows: number },
+    bootstrapPromise: Promise<void>,
+): vscode.ExtensionTerminalOptions {
+    const pty = new DtermPseudoterminal(sessionName, label, initialDims, bootstrapPromise);
+    ptyBySession.set(sessionName, pty);
+    return {
+        name: label ?? 'dterm',
+        pty,
         iconPath: activeCtx
             ? {
                   light: vscode.Uri.joinPath(activeCtx.extensionUri, 'icons', 'dterm-tab-light.svg'),
@@ -416,13 +669,36 @@ function buildOptions(
             : new vscode.ThemeIcon('plug'),
         color: new vscode.ThemeColor('terminal.ansiCyan'),
         location: viewColumn !== undefined ? { viewColumn } : undefined,
+        isTransient: true,
     };
 }
 
+// Spawn the hidden bootstrap stub, wait for it to exit (signals the daemon-side
+// shell is ready), and resolve. Used by both new-session creation and reattach
+// so the path is identical -- on reattach the daemon's `open` handler is a
+// no-op for the shell (existing session), but the env-refresh hook stays
+// available for future use.
+async function bootstrapShell(sessionName: string, cwd?: string): Promise<void> {
+    return new Promise<void>((resolve, reject) => {
+        const stub = vscode.window.createTerminal(buildBootstrapStubOptions(sessionName, cwd));
+        const timeout = setTimeout(() => {
+            disposable.dispose();
+            try { stub.dispose(); } catch { /* already gone */ }
+            reject(new Error('dterm: bootstrap timeout'));
+        }, 10_000);
+        const disposable = vscode.window.onDidCloseTerminal(t => {
+            if (t !== stub) return;
+            clearTimeout(timeout);
+            disposable.dispose();
+            const code = t.exitStatus?.code ?? 0;
+            if (code === 0) resolve();
+            else reject(new Error(`dterm: bootstrap stub exited with code ${code}`));
+        });
+    });
+}
+
 function sessionNameOf(t: vscode.Terminal): string | undefined {
-    const co = t.creationOptions as vscode.TerminalOptions;
-    const v = co.env?.DTERM_SESSION;
-    return typeof v === 'string' ? v : undefined;
+    return terminalToSession.get(t);
 }
 
 async function listLiveSessions(): Promise<string[] | undefined> {
@@ -519,43 +795,70 @@ async function reconnectAll(
         vscode.window.terminals.map(sessionNameOf).filter((n): n is string => Boolean(n)),
     );
     const cwd = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
-    // Panel sessions first so we can pop the panel via .show(true) on the
-    // first one as soon as it exists, rather than waiting for the full loop.
-    // Editor-area sessions follow, sorted by (viewColumn, tabIndex) — VS Code
-    // appends new terminals at the end of the target group, so creation order
-    // preserves relative position within each column.
+    // Sort to control creation order:
+    //   - Panel sessions first, ordered by panelIndex so reattach preserves
+    //     the user's panel tab order (or whatever they drag-reordered to).
+    //   - Editor-area sessions follow, sorted by (viewColumn, tabIndex). VS Code
+    //     appends new terminals at the end of the target group, so creation
+    //     order preserves relative position within each column.
+    //   - Tie-break by session name so sessions without a panelIndex (e.g.,
+    //     created very recently and not yet snapshotted) are deterministic.
     const sortedOurs = ours.slice().sort((a, b) => {
         const la = getMeta(a);
         const lb = getMeta(b);
-        if (la?.viewColumn !== undefined && lb?.viewColumn !== undefined) {
-            if (la.viewColumn !== lb.viewColumn) return la.viewColumn - lb.viewColumn;
-            return (la.tabIndex ?? 0) - (lb.tabIndex ?? 0);
+        const aIsEditor = la?.viewColumn !== undefined;
+        const bIsEditor = lb?.viewColumn !== undefined;
+        if (aIsEditor && bIsEditor) {
+            if (la!.viewColumn !== lb!.viewColumn) return la!.viewColumn! - lb!.viewColumn!;
+            return (la!.tabIndex ?? 0) - (lb!.tabIndex ?? 0);
         }
-        if (la?.viewColumn !== undefined) return 1;
-        if (lb?.viewColumn !== undefined) return -1;
+        if (aIsEditor) return 1;
+        if (bIsEditor) return -1;
+        const ai = la?.panelIndex ?? Number.MAX_SAFE_INTEGER;
+        const bi = lb?.panelIndex ?? Number.MAX_SAFE_INTEGER;
+        if (ai !== bi) return ai - bi;
         return a.localeCompare(b);
     });
-    let panelShown = false;
+    const created: { name: string; t: vscode.Terminal; isPanel: boolean }[] = [];
     for (const name of sortedOurs) {
         if (alreadyOpen.has(name)) {
             // Reload (not full window close+reopen) keeps existing dterm tabs
             // alive; just acknowledge them, don't recreate.
             const t = vscode.window.terminals.find(t => sessionNameOf(t) === name);
             log(`reconnectAll: already open ${name}`);
-            if (t && !panelShown) {
-                // preserveFocus avoids stealing focus from the active editor.
-                t.show(true);
-                panelShown = true;
+            if (t) {
+                const meta = getMeta(name);
+                created.push({ name, t, isPanel: meta?.viewColumn === undefined });
             }
             continue;
         }
         const meta = getMeta(name);
-        log(`reconnectAll: creating terminal for ${name} (${meta?.viewColumn !== undefined ? `col ${meta.viewColumn} idx ${meta.tabIndex ?? 0}` : 'panel'})`);
-        const t = vscode.window.createTerminal(buildOptions(name, cwd, meta?.label, meta?.viewColumn));
-        if (!panelShown && meta?.viewColumn === undefined) {
-            t.show(true);
-            panelShown = true;
-        }
+        log(`reconnectAll: creating terminal for ${name} (${meta?.viewColumn !== undefined ? `col ${meta.viewColumn} idx ${meta.tabIndex ?? 0}` : `panel idx ${meta?.panelIndex ?? '?'}`})`);
+        // Start bootstrap in the background; create the visible terminal
+        // immediately so the user sees it without waiting for daemon + shell-
+        // integration setup. The Pseudoterminal queues input until the
+        // bootstrap completes and the daemon connection is up.
+        const bootstrapPromise = bootstrapShell(name, cwd).catch(e => {
+            log(`reconnectAll: bootstrap failed for ${name}: ${(e as Error).message}`);
+            throw e;
+        });
+        const t = vscode.window.createTerminal(
+            buildPseudoOptions(name, meta?.label, meta?.viewColumn, { cols: 80, rows: 24 }, bootstrapPromise),
+        );
+        terminalToSession.set(t, name);
+        ptyBySession.get(name)?.attachTerminal(t);
+        created.push({ name, t, isPanel: meta?.viewColumn === undefined });
+    }
+    // Focus the saved-active terminal if it exists in this restore set;
+    // otherwise fall back to the first panel terminal so the panel pops open.
+    // preserveFocus on .show(true) keeps the active editor focused.
+    const savedActive = getActive();
+    const activeEntry = savedActive ? created.find(e => e.name === savedActive) : undefined;
+    if (activeEntry) {
+        activeEntry.t.show(true);
+    } else {
+        const firstPanel = created.find(e => e.isPanel);
+        firstPanel?.t.show(true);
     }
 }
 
@@ -646,42 +949,68 @@ async function ensureNodePty(ctx: vscode.ExtensionContext): Promise<boolean> {
 export function activate(ctx: vscode.ExtensionContext): void {
     activeCtx = ctx;
     void ensureNodePty(ctx);
-    ensureNodeShim();
 
     ctx.subscriptions.push(
         vscode.window.registerTerminalProfileProvider(PROFILE_ID, {
             async provideTerminalProfile() {
                 const cwd = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
-                const name = await allocateSessionName();
-                if (!name) {
-                    const fallback = `vscode-noworkspace-${process.pid}-${Date.now()}`;
-                    log(`profile: allocating fallback session ${fallback}`);
-                    pendingFocus.add(fallback);
-                    return new vscode.TerminalProfile(buildOptions(fallback, cwd));
-                }
-                log(`profile: allocated session ${name}`);
-                pendingFocus.add(name);
-                return new vscode.TerminalProfile(buildOptions(name, cwd));
+                const allocated = await allocateSessionName();
+                const sessionName = allocated ?? `vscode-noworkspace-${process.pid}-${Date.now()}`;
+                if (!allocated) log(`profile: allocating fallback session ${sessionName}`);
+                else log(`profile: allocated session ${sessionName}`);
+                pendingFocus.add(sessionName);
+                // Bootstrap runs in parallel with VS Code rendering the visible
+                // terminal. Returns immediately so the user sees the terminal
+                // within tens of ms; the Pseudoterminal queues input until the
+                // bootstrap+daemon attach completes.
+                const bootstrapPromise = bootstrapShell(sessionName, cwd).catch(e => {
+                    log(`profile: bootstrap failed for ${sessionName}: ${(e as Error).message}`);
+                    throw e;
+                });
+                return new vscode.TerminalProfile(
+                    buildPseudoOptions(sessionName, undefined, undefined, { cols: 80, rows: 24 }, bootstrapPromise),
+                );
             },
         }),
     );
 
     ctx.subscriptions.push(
-        vscode.window.tabGroups.onDidChangeTabs(() => snapshotLocations()),
-        vscode.window.tabGroups.onDidChangeTabGroups(() => snapshotLocations()),
-        vscode.window.onDidChangeActiveTerminal(() => snapshotLabels()),
+        vscode.window.tabGroups.onDidChangeTabs(() => void snapshotLocations()),
+        vscode.window.tabGroups.onDidChangeTabGroups(() => void snapshotLocations()),
+        vscode.window.onDidChangeActiveTerminal(() => {
+            void snapshotLabels();
+            // Capture the focused dterm session promptly so reload restores
+            // focus to the same terminal even if it happened seconds before
+            // the next polling tick.
+            const active = vscode.window.activeTerminal;
+            const activeName = active ? sessionNameOf(active) : undefined;
+            if (activeName !== undefined && getActive() !== activeName) {
+                void setActive(activeName);
+            }
+        }),
         vscode.window.onDidOpenTerminal(t => {
+            // Wire session mapping for Pseudoterminals VS Code created from
+            // our profile provider's TerminalProfile -- the provider returns a
+            // config, not the Terminal itself, so we couldn't register the
+            // mapping at construction time.
+            const co = t.creationOptions as vscode.ExtensionTerminalOptions;
+            const pty = co.pty;
+            if (pty instanceof DtermPseudoterminal) {
+                terminalToSession.set(t, pty.sessionName);
+                pty.attachTerminal(t);
+            }
             const name = sessionNameOf(t);
             if (name && pendingFocus.delete(name)) {
-                // For stub terminals there's no ready-state to wait on —
-                // the stub is starting up and will produce output as the
-                // shell prints its first prompt. Showing now is fine.
                 t.show();
             }
-            snapshotLabels();
+            void snapshotLabels();
+            // Snapshot order on every create -- otherwise a fresh terminal
+            // doesn't get its panelIndex until the next 2s poll, and a close
+            // before that loses the new index.
+            void snapshotLocations();
             ensurePolling();
         }),
-        vscode.window.onDidChangeTerminalState(() => snapshotLabels()),
+        vscode.window.onDidChangeTerminalState(() => void snapshotLabels()),
     );
 
     ctx.subscriptions.push(
@@ -709,15 +1038,17 @@ export function activate(ctx: vscode.ExtensionContext): void {
             if (!name) return;
             const reason = t.exitStatus?.reason;
             log(`close: ${name} reason=${reason} t.name="${t.name}"`);
+            // Drop the Pseudoterminal instance from our map so a subsequent
+            // recreate of the same session gets a fresh DtermPseudoterminal.
+            ptyBySession.delete(name);
             if (reason === vscode.TerminalExitReason.User) {
                 await daemonKill(name);
                 await setMeta(name, undefined);
                 return;
             }
-            // Window close / extension reload / process exit — snapshot the
-            // current label one last time so any rename done since the last
-            // poll tick is persisted before we go down.
-            snapshotLabels();
+            // Window close / extension reload / process exit -- snapshot
+            // both label and the (now-shifted) panel order before we go down.
+            await Promise.all([snapshotLabels(), snapshotLocations()]);
         }),
     );
 
@@ -851,7 +1182,13 @@ export async function deactivate(): Promise<void> {
         clearInterval(pollTimer);
         pollTimer = undefined;
     }
-    snapshotLabels();
-    snapshotLocations();
+    // Await so that workspaceState writes for label/location/active flush
+    // before VS Code releases the workspace state on shutdown -- otherwise
+    // the next workspace load sees stale data.
+    try {
+        await Promise.all([snapshotLabels(), snapshotLocations()]);
+    } catch (e) {
+        log(`deactivate: snapshot flush failed: ${(e as Error).message}`);
+    }
     activeCtx = undefined;
 }

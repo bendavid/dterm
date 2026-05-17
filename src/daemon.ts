@@ -69,7 +69,20 @@ interface Session {
     exited: boolean;
     lastProcessName: string;
     processPoller?: NodeJS.Timeout;
+    // Flips true the first time we see VS Code's shell-integration script's
+    // one-shot HasRichCommandDetection advertisement in the pty stream. The
+    // script emits this once at load time and never again; SerializeAddon
+    // doesn't preserve OSC sequences, so any client that attached after the
+    // original emission (or that attaches in a future window/reload) would
+    // miss it and the tab tooltip would stay at "basic". When this flag is
+    // true we replay the OSC into the client's stream right after the snapshot.
+    hasShellIntegration: boolean;
 }
+
+// The exact sequence VS Code's bash/zsh/fish integration scripts emit at load
+// time. Used both as a scan target on the shell's output and as the replay
+// payload sent to late-attaching clients.
+const RICH_INTEGRATION_OSC = '\x1b]633;P;HasRichCommandDetection=True\x07';
 
 interface Client {
     socket: net.Socket;
@@ -182,12 +195,17 @@ function createSession(
         clients: new Set(),
         exited: false,
         lastProcessName: '',
+        hasShellIntegration: false,
     };
     session.processPoller = setInterval(() => pollProcessName(session), 750);
     session.processPoller.unref?.();
 
     ptyProc.onData(data => {
         session.emulator.write(data);
+        if (!session.hasShellIntegration && data.includes(RICH_INTEGRATION_OSC)) {
+            session.hasShellIntegration = true;
+            log('shell integration confirmed', name);
+        }
         const buf = Buffer.from(data, 'utf8');
         const msg: DaemonMessage = { type: 'output', data: buf.toString('base64') };
         for (const c of session.clients) send(c, msg);
@@ -246,11 +264,28 @@ function handleMessage(client: Client, msg: ClientMessage) {
             }
             client.session = session;
             session.clients.add(client);
-            send(client, { type: 'opened', name: msg.name, cols: session.cols, rows: session.rows, created });
+            send(client, {
+                type: 'opened',
+                name: msg.name,
+                cols: session.cols,
+                rows: session.rows,
+                created,
+            });
             if (!created) {
                 const snap = snapshotEmulatorState(session);
                 if (snap.length > 0) {
                     send(client, { type: 'output', data: snap.toString('base64') });
+                }
+                // Replay the one-shot HasRichCommandDetection advertisement so
+                // a late-attaching client (the typical Pseudoterminal case --
+                // it connects after the bootstrap stub has already disconnected
+                // and the shell-integration script has already loaded) sees
+                // rich-detection state. The script doesn't re-emit; snapshot
+                // strips OSC. For brand-new sessions (created=true) we let the
+                // shell's own emission flow naturally to the client.
+                if (session.hasShellIntegration) {
+                    const buf = Buffer.from(RICH_INTEGRATION_OSC, 'utf8');
+                    send(client, { type: 'output', data: buf.toString('base64') });
                 }
             }
             pollProcessName(session);
