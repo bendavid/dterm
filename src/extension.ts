@@ -712,6 +712,18 @@ class DtermPseudoterminal implements vscode.Pseudoterminal {
             delete env.DTERM_BOOTSTRAP_SOCKET;
             delete env.DTERM_SESSION;
             delete env.DTERM_REAL_SHELL;
+            // Apply our workspace-scoped symlink indirection for managed
+            // sockets (SSH_AUTH_SOCK, VSCODE_GIT_IPC_HANDLE). We can't rely
+            // on TerminalOptions.env to deliver these to the spawned shell
+            // because VS Code applies EnvironmentVariableCollection mutators
+            // *after* TerminalOptions.env, and the Remote-SSH / git extensions
+            // contribute Replace mutators that overwrite our values with the
+            // raw rotating upstream paths. By applying here -- after capture,
+            // before sending to the daemon -- we get the symlink paths into
+            // the actual shell's env so they stay valid across reconnects
+            // (refreshManagedSockets keeps the symlink target updated to the
+            // current upstream).
+            Object.assign(env, refreshManagedSockets());
             msg = {
                 type: 'open',
                 name: this.sessionName,
@@ -871,21 +883,19 @@ function buildBootstrapStubOptions(
     const cfg = shellConfig();
     const shellBinary = resolveShellBinary(cfg.shell);
     const { stubPath, shimName } = stubPathForShell(shellBinary);
-    // Symlink overrides for managed sockets so reattached terminals continue
-    // to see live SSH_AUTH_SOCK / VSCODE_GIT_IPC_HANDLE. VS Code's env
-    // collections would otherwise put the literal current socket path into
-    // the stub's env, baking it into the running shell.
-    //
-    // ELECTRON_RUN_AS_NODE makes process.execPath (VS Code's Electron binary
-    // on a local install) behave as plain Node so the stub's shebang resolves.
-    // Real Node ignores the var, so this is safe on remote/server hosts where
-    // process.execPath is already standalone Node. The daemon strips it
-    // before spawning the user's shell.
+    // The stub only needs enough env to know where to write its captured
+    // payload (DTERM_BOOTSTRAP_SOCKET), to behave as Node when launched via
+    // Electron (ELECTRON_RUN_AS_NODE), and to know which real shell binary
+    // the daemon should spawn (DTERM_REAL_SHELL, when the shim basename
+    // doesn't match the configured shell). The managed-socket symlink
+    // indirection (SSH_AUTH_SOCK, VSCODE_GIT_IPC_HANDLE) is applied later,
+    // in the Pseudoterminal's connect() before the env is sent to the
+    // daemon, because TerminalOptions.env doesn't reliably override values
+    // contributed by other extensions' EnvironmentVariableCollections.
     const env: { [key: string]: string } = {
         DTERM_SESSION: sessionName,
         DTERM_BOOTSTRAP_SOCKET: sockPath,
         ELECTRON_RUN_AS_NODE: '1',
-        ...refreshManagedSockets(),
     };
     if (shimName === 'dterm' || path.basename(shellBinary) !== shimName) {
         env.DTERM_REAL_SHELL = shellBinary;
