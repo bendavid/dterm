@@ -50,6 +50,17 @@ function nameWithSession(visible: string, sessionName: string): string {
     return `${visible}${FG_NAME_MARKER}${encodeSessionTag(sessionName)}`;
 }
 
+// "Did dterm produce this name?" Returns true if the value's invisible tag-
+// encoded portion decodes to the given session name. Used in preference to
+// a bare marker-presence check because the marker character (U+200B) alone
+// is not a unique-to-us signal -- a user could paste a string containing
+// one and we'd misidentify it as ours. Decoding to exactly this session's
+// id is a strong signal that only our nameWithSession()-emitting paths
+// could have produced.
+function nameMatchesOurSession(value: string, sessionName: string): boolean {
+    return decodeSessionTag(value) === sessionName;
+}
+
 let activeCtx: vscode.ExtensionContext | undefined;
 let logChannel: vscode.OutputChannel | undefined;
 let daemonLogChannel: vscode.OutputChannel | undefined;
@@ -221,15 +232,15 @@ function getSessionFromTab(tab: vscode.Tab): string | undefined {
         everSeenInEditor.add(decoded);
         return decoded;
     }
-    // Fallback: tab.label has no encoding -> the terminal was user-renamed
-    // before we observed this tab (e.g., user renamed a panel terminal and
-    // then dragged it into an editor group). Strict label equality match.
-    // No normalization: an unrenamed dterm terminal currently showing the
+    // Defensive fallback: tab.label has no encoding. With the user-rename
+    // override path (Pseudoterminal.applyUserLabel), this should be rare --
+    // a window of at most one snapshotLabels tick between a user pressing
+    // Enter on inline-rename and our re-fire that puts the encoded session
+    // id back. The strict label-equality match handles this window. No
+    // normalization: an unrenamed dterm terminal currently showing the
     // process name "bash" has t.name = "bash​<encoded>", which will
-    // not strict-equal "bash" -- so a user renaming a different terminal
-    // to "bash" can't cross-match an unrenamed sibling. The only collision
-    // is two terminals both user-renamed to the same exact string, which
-    // is genuine user ambiguity.
+    // not strict-equal "bash", so a user renaming a different terminal to
+    // "bash" can't cross-match an unrenamed sibling.
     for (const t of vscode.window.terminals) {
         const sName = sessionNameOf(t);
         if (!sName) continue;
@@ -251,28 +262,9 @@ function snapshotLabels(): Promise<void> {
         if (!pty) continue;
         const current = getMeta(sName);
         const name = t.name;
-        // Marker present -> the displayed name came from dterm (our default
-        // TerminalOptions.name or an onDidChangeName fire). Whether we're
-        // currently locked tells us how to interpret this:
-        //   - Locked: user previously inline-renamed, and now the marker
-        //     name is back. That can only mean the user cleared the rename
-        //     (VS Code fell back from the Api-source title to the
-        //     Process-source title, which is our last fire). Unlock so daemon
-        //     process_name updates drive the tab again, and drop the saved
-        //     label.
-        //   - Unlocked: normal dynamic-name operation. Nothing to do.
-        if (name.includes(FG_NAME_MARKER)) {
-            if (pty.isNameLocked()) {
-                pty.unlockName();
-                if (current?.label !== undefined) {
-                    writes.push(setMeta(sName, { ...current, label: undefined }));
-                }
-            }
-            continue;
-        }
-        // Empty rename can also resolve directly to '' on some VS Code paths
-        // (older behavior; kept as a defensive branch). Same semantics as
-        // marker-came-back-while-locked.
+        // Empty name -> user cleared their inline-rename. Drop the lock so
+        // daemon-driven process-name updates take over again, and clear the
+        // persisted label.
         if (name === '') {
             pty.unlockName();
             if (current?.label !== undefined) {
@@ -280,8 +272,18 @@ function snapshotLabels(): Promise<void> {
             }
             continue;
         }
-        // No marker, non-empty -> user inline-renamed to a custom value.
-        if (!pty.detectAndLockUserRename()) continue;
+        // Decodes to our session id -> we produced this value (either an
+        // auto-process-name fire or our applied user-label override). Nothing
+        // to do; the tab still carries our identity.
+        if (nameMatchesOurSession(name, sName)) continue;
+        // Else: user inline-renamed to a custom value (or pasted something
+        // unrelated). Apply the override: re-fire with the user's visible
+        // value but our marker + encoded session id appended, so the tab
+        // continues to carry the session id for tab-to-session mapping. The
+        // visible portion is preserved verbatim from what the user typed.
+        // Locks daemon-driven updates as a side effect, preserving the
+        // user's expressed preference.
+        pty.applyUserLabel(name);
         if (current?.label !== name) {
             writes.push(setMeta(sName, { ...current, label: name }));
         }
@@ -652,6 +654,12 @@ class DtermPseudoterminal implements vscode.Pseudoterminal {
     // Locked once a user rename is observed (or once we restore a saved label).
     // While locked, daemon process_name updates do not override the visible name.
     private nameLocked: boolean;
+    // The user's clean inline-renamed value (no marker, no encoding) when a
+    // rename is active. Stored so we can re-apply it via applyUserLabel after
+    // any event that wipes our enriched value out of Api source (notably the
+    // user typing a fresh rename). Distinct from lastFiredName, which carries
+    // the enriched marker+encoding.
+    private userLabel: string | undefined;
     // The latest foreground process name the daemon reported, regardless of
     // whether the name is currently locked. Used to re-fire onDidChangeName
     // immediately when unlocking, so the user doesn't have to wait for the
@@ -748,17 +756,18 @@ class DtermPseudoterminal implements vscode.Pseudoterminal {
         this.term = t;
     }
 
-    // Returns true and locks future auto-updates if t.name lacks the U+200B
-    // marker dterm appends to every name it sets. Any unmarked value in t.name
-    // must have come from a user inline-rename (the only other path that
-    // writes to it). No comparison against lastFiredName needed -- the marker
-    // is a synchronous, race-free signal.
-    detectAndLockUserRename(): boolean {
-        if (this.nameLocked) return true;
-        if (!this.term) return false;
-        if (this.term.name.includes(FG_NAME_MARKER)) return false;
+    // Record a user-typed label and re-fire with the encoded session ID
+    // appended so the tab continues to carry our identity for tab-to-session
+    // mapping. The visible portion ("myterm") is preserved verbatim; only
+    // invisible characters (marker + tag-encoded session id) are added.
+    // Suppresses subsequent daemon-driven process-name updates by locking,
+    // which preserves the user's expressed intent.
+    applyUserLabel(label: string): void {
+        this.userLabel = label;
         this.nameLocked = true;
-        return true;
+        const enriched = nameWithSession(label, this.sessionName);
+        this.nameEmitter.fire(enriched);
+        this.lastFiredName = enriched;
     }
 
     open(initialDimensions: vscode.TerminalDimensions | undefined): void {
@@ -895,12 +904,12 @@ class DtermPseudoterminal implements vscode.Pseudoterminal {
     private handleProcessName(name: string): void {
         this.lastProcessNameSeen = name;
         if (this.nameLocked) return;
-        // Append the marker AND the tag-encoded session ID. The marker lets
-        // detectAndLockUserRename tell our fires apart from user inline-
-        // renames; the encoded session ID lets getSessionFromTab recover
-        // which dterm session this tab represents without relying on label
-        // matching (which collides for terminals sharing a process name).
-        // Both are invisible in the tab UI.
+        // Append the marker AND the tag-encoded session ID. The encoded ID
+        // lets getSessionFromTab recover which dterm session this tab
+        // represents without relying on label matching (which would collide
+        // for unrenamed terminals all showing the same process name). The
+        // marker is the visible-vs-encoded delimiter. Both are invisible in
+        // the tab UI.
         const marked = nameWithSession(name, this.sessionName);
         this.nameEmitter.fire(marked);
         this.lastFiredName = marked;
@@ -912,21 +921,13 @@ class DtermPseudoterminal implements vscode.Pseudoterminal {
     // without waiting for the next daemon event.
     unlockName(): void {
         this.nameLocked = false;
+        this.userLabel = undefined;
         this.lastFiredName = undefined;
         if (this.lastProcessNameSeen) {
             const marked = nameWithSession(this.lastProcessNameSeen, this.sessionName);
             this.nameEmitter.fire(marked);
             this.lastFiredName = marked;
         }
-    }
-
-    // True if the lock that suppresses daemon-driven name updates is currently
-    // engaged. Exposed so snapshotLabels can detect "user cleared their inline
-    // rename" -- in that case t.name falls back from the user-set Api-source
-    // title to our marker-tagged Process-source title, and seeing the marker
-    // come back while we were locked is the signal to unlock.
-    isNameLocked(): boolean {
-        return this.nameLocked;
     }
 
     handleInput(data: string): void {
