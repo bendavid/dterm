@@ -58,6 +58,10 @@
         "title": "dterm: Show diagnostics"
       },
       {
+        "command": "dterm.checkEnvFreshness",
+        "title": "dterm: Check env freshness (compare active session env to a fresh capture)"
+      },
+      {
         "command": "dterm.restartDaemon",
         "title": "dterm: Restart daemon (kills all sessions)"
       },

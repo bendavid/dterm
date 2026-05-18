@@ -357,6 +357,32 @@ function handleMessage(client: Client, msg: ClientMessage) {
             send(client, { type: 'version_response', version: DAEMON_VERSION });
             return;
         }
+        case 'get_session_env': {
+            // Read the current env of the daemon-side shell from
+            // /proc/<pid>/environ. Used by the extension's
+            // dterm.checkEnvFreshness diagnostic to detect drift between the
+            // env this shell was spawned with and what VS Code would inject
+            // for a freshly-spawned terminal now.
+            const session = sessions.get(msg.name);
+            if (!session) {
+                send(client, { type: 'error', message: `unknown session ${msg.name}` });
+                return;
+            }
+            const env: Record<string, string> = {};
+            try {
+                const raw = fs.readFileSync(`/proc/${session.pid}/environ`);
+                for (const entry of raw.toString('utf8').split('\0')) {
+                    if (!entry) continue;
+                    const eq = entry.indexOf('=');
+                    if (eq > 0) env[entry.slice(0, eq)] = entry.slice(eq + 1);
+                }
+            } catch (e) {
+                send(client, { type: 'error', message: `failed to read environ for pid ${session.pid}: ${(e as Error).message}` });
+                return;
+            }
+            send(client, { type: 'session_env_response', name: msg.name, env });
+            return;
+        }
     }
 }
 

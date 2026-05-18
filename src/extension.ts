@@ -1291,6 +1291,132 @@ async function reconnectAll(
     (activeEntry ?? panelEntry)?.t.show(true);
 }
 
+// Diagnostic: compare the env of the active dterm's daemon-side shell to
+// what VS Code would inject for a freshly-spawned terminal right now, and
+// show the diff. Useful for spotting drift in rotating endpoints
+// (CLAUDE_CODE_SSE_PORT, VSCODE_GIT_IPC_HANDLE, VSCODE_IPC_HOOK_CLI,
+// VSCODE_SHELL_INTEGRATION_NONCE, ...) that the daemon's long-lived shells
+// can't see updates to without a fresh spawn.
+async function checkEnvFreshness(): Promise<void> {
+    const active = vscode.window.activeTerminal;
+    if (!active) {
+        vscode.window.showInformationMessage('dterm: no active terminal.');
+        return;
+    }
+    const sessionName = sessionNameOf(active);
+    if (!sessionName) {
+        vscode.window.showInformationMessage('dterm: active terminal is not a dterm session.');
+        return;
+    }
+    const sessionEnv = await fetchSessionEnv(sessionName);
+    if (!sessionEnv) {
+        vscode.window.showErrorMessage(`dterm: failed to read env of session ${sessionName}.`);
+        return;
+    }
+    let freshResult: BootstrapResult;
+    try {
+        freshResult = await vscode.window.withProgress(
+            { location: vscode.ProgressLocation.Notification, title: 'dterm: capturing fresh env...', cancellable: false },
+            () => bootstrapShell(`envfresh-${process.pid}-${Date.now()}`),
+        );
+    } catch (e) {
+        vscode.window.showErrorMessage(`dterm: bootstrap capture failed: ${(e as Error).message}`);
+        return;
+    }
+    const ch = vscode.window.createOutputChannel('dterm: env freshness');
+    renderEnvDiff(ch, sessionName, sessionEnv, freshResult.env);
+    ch.show(true);
+}
+
+async function fetchSessionEnv(name: string): Promise<Record<string, string> | undefined> {
+    const resp = await oneShot(
+        daemonScriptPath(),
+        { type: 'get_session_env', name },
+        m => m.type === 'session_env_response' || m.type === 'error',
+        5000,
+    );
+    if (!resp || resp.type !== 'session_env_response') return undefined;
+    return resp.env;
+}
+
+// Keys that rotate or get updated by VS Code / extensions on
+// reload/reconnect. We highlight drift on these because they're the ones
+// that actually matter for end-user-visible misbehaviour (askpass not
+// working, shell-integration nonce mismatch, Claude Code SSE port stale,
+// etc.). Anything else that drifts (PATH adjustments by the user's shell
+// rc, transient PWD, etc.) is shown under "other" for completeness.
+const VOLATILE_ENV_PREFIXES = ['VSCODE_', 'GIT_', 'SSH_', 'CLAUDE_'];
+function isVolatileKey(k: string): boolean {
+    return VOLATILE_ENV_PREFIXES.some(p => k.startsWith(p))
+        || k === 'TERM_PROGRAM'
+        || k === 'TERM_PROGRAM_VERSION'
+        || k === 'COLORTERM';
+}
+
+function renderEnvDiff(
+    ch: vscode.OutputChannel,
+    sessionName: string,
+    sessionEnv: Record<string, string>,
+    freshEnv: Record<string, string>,
+): void {
+    const allKeys = new Set<string>([...Object.keys(sessionEnv), ...Object.keys(freshEnv)]);
+    const changed: string[] = [];
+    const sessionOnly: string[] = [];
+    const freshOnly: string[] = [];
+    for (const k of allKeys) {
+        const inS = k in sessionEnv;
+        const inF = k in freshEnv;
+        if (inS && inF) {
+            if (sessionEnv[k] !== freshEnv[k]) changed.push(k);
+        } else if (inS) {
+            sessionOnly.push(k);
+        } else {
+            freshOnly.push(k);
+        }
+    }
+    const sort = (a: string[]) => a.sort((x, y) => {
+        // Volatile keys first, then alphabetical.
+        const vx = isVolatileKey(x);
+        const vy = isVolatileKey(y);
+        if (vx !== vy) return vx ? -1 : 1;
+        return x.localeCompare(y);
+    });
+    sort(changed); sort(sessionOnly); sort(freshOnly);
+
+    ch.appendLine('=== dterm: env freshness ===');
+    ch.appendLine(`session: ${sessionName}`);
+    ch.appendLine(`captured at: ${new Date().toISOString()}`);
+    ch.appendLine('');
+    ch.appendLine(`Differs (${changed.length}; values rotated on reconnect or otherwise changed):`);
+    if (changed.length === 0) ch.appendLine('  (none)');
+    for (const k of changed) {
+        const tag = isVolatileKey(k) ? '*' : ' ';
+        ch.appendLine(`  ${tag} ${k}`);
+        ch.appendLine(`        session: ${truncate(sessionEnv[k], 200)}`);
+        ch.appendLine(`        fresh:   ${truncate(freshEnv[k], 200)}`);
+    }
+    ch.appendLine('');
+    ch.appendLine(`Only in session (${sessionOnly.length}; set when session was created, no longer injected):`);
+    if (sessionOnly.length === 0) ch.appendLine('  (none)');
+    for (const k of sessionOnly) {
+        const tag = isVolatileKey(k) ? '*' : ' ';
+        ch.appendLine(`  ${tag} ${k}=${truncate(sessionEnv[k], 200)}`);
+    }
+    ch.appendLine('');
+    ch.appendLine(`Only in fresh (${freshOnly.length}; injected now but missing from running session):`);
+    if (freshOnly.length === 0) ch.appendLine('  (none)');
+    for (const k of freshOnly) {
+        const tag = isVolatileKey(k) ? '*' : ' ';
+        ch.appendLine(`  ${tag} ${k}=${truncate(freshEnv[k], 200)}`);
+    }
+    ch.appendLine('');
+    ch.appendLine('(* = key likely controlled by VS Code or an extension)');
+}
+
+function truncate(s: string, n: number): string {
+    return s.length <= n ? s : s.slice(0, n) + `… [${s.length} chars]`;
+}
+
 // One-shot dump of tabGroups.all, terminals, and active terminal so we can see
 // what the public API actually surfaces -- specifically whether aux-window tab
 // groups are visible (with what viewColumn) and how aux-window terminals appear
@@ -1602,6 +1728,10 @@ export function activate(ctx: vscode.ExtensionContext): void {
             ch.appendLine('---');
             ch.show(true);
         }),
+    );
+
+    ctx.subscriptions.push(
+        vscode.commands.registerCommand('dterm.checkEnvFreshness', () => checkEnvFreshness()),
     );
 
     ctx.subscriptions.push(

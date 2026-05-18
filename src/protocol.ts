@@ -16,7 +16,8 @@ export type ClientMessage =
     | { type: 'detach' }
     | { type: 'set_scrollback_lines'; lines: number }
     | { type: 'shutdown' }
-    | { type: 'version' };
+    | { type: 'version' }
+    | { type: 'get_session_env'; name: string };
 
 export type DaemonMessage =
     | { type: 'opened'; name: string; cols: number; rows: number; created: boolean }
@@ -26,6 +27,7 @@ export type DaemonMessage =
     | { type: 'killed'; name: string }
     | { type: 'session_end'; name: string; exitCode?: number; signal?: number }
     | { type: 'version_response'; version: string }
+    | { type: 'session_env_response'; name: string; env: Record<string, string> }
     | { type: 'error'; message: string };
 
 export function encode(msg: ClientMessage | DaemonMessage): string {
