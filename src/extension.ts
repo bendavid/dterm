@@ -1323,8 +1323,22 @@ async function checkEnvFreshness(): Promise<void> {
         vscode.window.showErrorMessage(`dterm: bootstrap capture failed: ${(e as Error).message}`);
         return;
     }
+    // The bootstrap stub's process.env carries vars that we inject in
+    // buildBootstrapStubOptions purely for the stub's own use
+    // (DTERM_BOOTSTRAP_SOCKET so it knows the socket path, ELECTRON_RUN_AS_NODE
+    // so its shebang resolves, etc.). The Pseudoterminal strips these before
+    // sending env to the daemon, and the daemon strips ELECTRON_RUN_AS_NODE
+    // again, so the real shell never sees them. Apply the same stripping here
+    // so the diff reflects what a real new shell would actually receive, not
+    // the stub's plumbing.
+    const freshEnv: Record<string, string> = { ...freshResult.env };
+    delete freshEnv.ELECTRON_RUN_AS_NODE;
+    delete freshEnv.ELECTRON_NO_ATTACH_CONSOLE;
+    delete freshEnv.DTERM_BOOTSTRAP_SOCKET;
+    delete freshEnv.DTERM_SESSION;
+    delete freshEnv.DTERM_REAL_SHELL;
     const ch = vscode.window.createOutputChannel('dterm: env freshness');
-    renderEnvDiff(ch, sessionName, sessionEnv, freshResult.env);
+    renderEnvDiff(ch, sessionName, sessionEnv, freshEnv);
     ch.show(true);
 }
 
