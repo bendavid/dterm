@@ -15,10 +15,39 @@ let daemonLogChannel: vscode.OutputChannel | undefined;
 let pollTimer: NodeJS.Timeout | undefined;
 const pendingFocus = new Set<string>();
 
+// Per-client scoping prefix for workspaceState keys. dterm runs as a
+// workspace-kind extension, so its workspaceState/globalState live on the
+// remote in remote scenarios -- shared across every client that connects to
+// that remote. Without per-client scoping, two laptops SSH-ing into the same
+// remote would step on each other's terminal layouts.
+//
+// The companion `dterm-client` extension (extensionKind: "ui") runs on the
+// client side, mints a stable per-client UUID, persists it in its own
+// globalState (which on the UI side is in the client's local user-data dir),
+// and exposes it via the `dterm-client.getClientId` command. We call that
+// command at activation and use the returned UUID as the scoping prefix.
+//
+// If the companion isn't installed (command throws), we fall back to
+// vscode.env.machineId -- which on a remote is the remote's machineId, so
+// effectively no per-client scoping, but at least we don't break.
+let clientId: string = vscode.env.machineId;
+
+async function resolveClientId(): Promise<void> {
+    try {
+        const id = await vscode.commands.executeCommand<string>('dterm-client.getClientId');
+        if (typeof id === 'string' && id.length > 0) {
+            clientId = id;
+            log(`resolved clientId via dterm-client: ${id}`);
+        } else {
+            log(`dterm-client.getClientId returned ${JSON.stringify(id)}; falling back to machineId ${vscode.env.machineId}`);
+        }
+    } catch (e) {
+        log(`dterm-client.getClientId unavailable (${(e as Error)?.message ?? e}); falling back to machineId ${vscode.env.machineId}`);
+    }
+}
+
 // Per-session UI metadata (label, editor-area location, panel order). Stored
-// in workspaceState under a client-specific key derived from vscode.env.machineId
-// so two laptops connecting to the same remote get independent layouts --
-// matching how VS Code's built-in terminal layout is local-to-client.
+// in workspaceState under the client-scoped key prefix.
 interface SessionMeta {
     label?: string;
     viewColumn?: number;
@@ -30,14 +59,14 @@ interface SessionMeta {
 }
 
 function metaKey(sessionName: string): string {
-    return `client.${vscode.env.machineId}.session.${sessionName}`;
+    return `client.${clientId}.session.${sessionName}`;
 }
 
 // Separate key for the focused-terminal session. Not per-session because at most
 // one terminal is active at a time; storing as a flat key avoids churn-y meta
 // updates across every session.
 function activeKey(): string {
-    return `client.${vscode.env.machineId}.active`;
+    return `client.${clientId}.active`;
 }
 
 // Tracks the most recent panel terminal that was the global active terminal.
@@ -45,7 +74,7 @@ function activeKey(): string {
 // state even when the global active is an editor-area terminal -- reattach
 // needs to restore both so the panel reopens at the right tab.
 function panelActiveKey(): string {
-    return `client.${vscode.env.machineId}.panel-active`;
+    return `client.${clientId}.panel-active`;
 }
 
 function getActive(): string | undefined {
@@ -73,10 +102,12 @@ async function setPanelActive(sessionName: string | undefined): Promise<void> {
 // terminal -- reattach needs to restore each column to whichever dterm was
 // last selected there even when the global focus was elsewhere.
 function editorActiveKey(viewColumn: number): string {
-    return `client.${vscode.env.machineId}.editor-active.${viewColumn}`;
+    return `client.${clientId}.editor-active.${viewColumn}`;
 }
 
-const EDITOR_ACTIVE_PREFIX = `client.${vscode.env.machineId}.editor-active.`;
+function editorActivePrefix(): string {
+    return `client.${clientId}.editor-active.`;
+}
 
 function getEditorActive(viewColumn: number): string | undefined {
     if (!activeCtx) return undefined;
@@ -303,7 +334,7 @@ function ensurePolling(): void {
 
 function pruneStaleMeta(liveSessionNames: Set<string>): void {
     if (!activeCtx) return;
-    const prefix = `client.${vscode.env.machineId}.session.`;
+    const prefix = `client.${clientId}.session.`;
     for (const key of activeCtx.workspaceState.keys()) {
         if (!key.startsWith(prefix)) continue;
         const session = key.slice(prefix.length);
@@ -322,8 +353,9 @@ function pruneStaleMeta(liveSessionNames: Set<string>): void {
         void setPanelActive(undefined);
     }
     // Drop per-editor-column active entries that point at dead sessions.
+    const editorPrefix = editorActivePrefix();
     for (const key of activeCtx.workspaceState.keys()) {
-        if (!key.startsWith(EDITOR_ACTIVE_PREFIX)) continue;
+        if (!key.startsWith(editorPrefix)) continue;
         const value = activeCtx.workspaceState.get<string>(key);
         if (value && !liveSessionNames.has(value)) {
             void activeCtx.workspaceState.update(key, undefined);
@@ -1173,6 +1205,10 @@ export function activate(ctx: vscode.ExtensionContext): void {
     );
 
     void (async () => {
+        // Resolve clientId BEFORE any code path reads workspaceState keys --
+        // they all derive from the prefix that includes clientId, so reading
+        // with the wrong prefix would miss saved values.
+        await resolveClientId();
         logTabGroupsState('activate');
         const { restarted } = await checkDaemonVersion(ctx);
         if (restarted) return;

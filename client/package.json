@@ -1,0 +1,36 @@
+{
+  "name": "dterm-client",
+  "displayName": "dterm client companion",
+  "description": "Per-client identity helper for dterm. Runs UI-side so two laptops connecting to the same remote can keep independent terminal layouts.",
+  "publisher": "local",
+  "version": "0.5.0",
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "extensionKind": [
+    "ui"
+  ],
+  "main": "./out/extension.js",
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "contributes": {
+    "commands": [
+      {
+        "command": "dterm-client.getClientId",
+        "title": "dterm: Get client identifier (internal)"
+      }
+    ]
+  },
+  "scripts": {
+    "compile": "tsc -p ."
+  },
+  "devDependencies": {
+    "@types/node": "20.x",
+    "@types/vscode": "^1.90.0",
+    "typescript": "^5.4.0"
+  }
+}
