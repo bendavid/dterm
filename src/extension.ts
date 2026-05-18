@@ -40,6 +40,14 @@ function activeKey(): string {
     return `client.${vscode.env.machineId}.active`;
 }
 
+// Tracks the most recent panel terminal that was the global active terminal.
+// Distinct from activeKey because a panel terminal still has a "selected tab"
+// state even when the global active is an editor-area terminal -- reattach
+// needs to restore both so the panel reopens at the right tab.
+function panelActiveKey(): string {
+    return `client.${vscode.env.machineId}.panel-active`;
+}
+
 function getActive(): string | undefined {
     if (!activeCtx) return undefined;
     return activeCtx.workspaceState.get<string>(activeKey());
@@ -48,6 +56,36 @@ function getActive(): string | undefined {
 async function setActive(sessionName: string | undefined): Promise<void> {
     if (!activeCtx) return;
     await activeCtx.workspaceState.update(activeKey(), sessionName);
+}
+
+function getPanelActive(): string | undefined {
+    if (!activeCtx) return undefined;
+    return activeCtx.workspaceState.get<string>(panelActiveKey());
+}
+
+async function setPanelActive(sessionName: string | undefined): Promise<void> {
+    if (!activeCtx) return;
+    await activeCtx.workspaceState.update(panelActiveKey(), sessionName);
+}
+
+// Per-editor-column active session. Distinct from activeKey because each
+// editor group keeps its own selected tab independent of the global active
+// terminal -- reattach needs to restore each column to whichever dterm was
+// last selected there even when the global focus was elsewhere.
+function editorActiveKey(viewColumn: number): string {
+    return `client.${vscode.env.machineId}.editor-active.${viewColumn}`;
+}
+
+const EDITOR_ACTIVE_PREFIX = `client.${vscode.env.machineId}.editor-active.`;
+
+function getEditorActive(viewColumn: number): string | undefined {
+    if (!activeCtx) return undefined;
+    return activeCtx.workspaceState.get<string>(editorActiveKey(viewColumn));
+}
+
+async function setEditorActive(viewColumn: number, sessionName: string | undefined): Promise<void> {
+    if (!activeCtx) return;
+    await activeCtx.workspaceState.update(editorActiveKey(viewColumn), sessionName);
 }
 
 function getMeta(sessionName: string): SessionMeta | undefined {
@@ -82,15 +120,28 @@ function log(line: string): void {
 // daemon-driven names apart from user-typed renames.
 const FG_NAME_MARKER = '​';
 
-// Tab-title values to ignore as "not a user rename." The stub's interpreter
-// usually shows up here briefly between exec() and our `process.title` setter
-// firing: "env" from `/usr/bin/env node` shebang resolution (the kernel
-// initially exec's /usr/bin/env), then "node" once env resolves its second
-// argument. /proc/comm is set from the basename in execve, so even with
-// ELECTRON_RUN_AS_NODE active and the resolved binary being VS Code's
-// Electron, the kernel still records "node" (not "electron"). Neither
-// value is something a user would meaningfully type as a tab label.
-const PROC_NAME_BLACKLIST = new Set(['env', 'node']);
+// Tab-title values to ignore as "not a user rename."
+//
+// "env" / "node" appear briefly during stub startup (kernel's /proc/comm from
+// the shebang resolver), before our process.title setter takes effect.
+//
+// "bash" / "zsh" / "fish" / "dterm" cover the basenames of our shim symlinks
+// (postcompile.js creates these in out/shims/). VS Code seeds the terminal's
+// initial title from the shellPath basename before /proc/comm polling kicks
+// in, producing a brief window where t.name matches the shim basename
+// without our U+200B marker -- exactly long enough for snapshotLabels to
+// catch it and wrongly persist as a user label, which would then freeze the
+// tab title forever on reattach via TerminalOptions.name. Including the
+// shim basenames stops the persist at the cost of preventing the user from
+// renaming a terminal to literally "bash" / "zsh" / "fish" / "dterm".
+const PROC_NAME_BLACKLIST = new Set([
+    'env', 'node',
+    'bash', 'zsh', 'fish', 'dterm',
+]);
+
+// Per-session last-logged t.name so we only emit the hex-dump diagnostic when
+// the name actually changes (snapshotLabels runs every 2s + on every event).
+const lastLoggedName = new Map<string, string>();
 
 function snapshotLabels(): Promise<void> {
     const writes: Promise<void>[] = [];
@@ -99,6 +150,11 @@ function snapshotLabels(): Promise<void> {
         if (!sName) continue;
         const current = getMeta(sName);
         const name = t.name;
+        if (lastLoggedName.get(sName) !== name) {
+            const hex = Array.from(name).map(c => c.codePointAt(0)!.toString(16).padStart(4, '0')).join(' ');
+            log(`snapshotLabels: ${sName} t.name=${JSON.stringify(name)} hex=[${hex}]`);
+            lastLoggedName.set(sName, name);
+        }
         // Empty rename -- VS Code's inline tab rename to "" -- means the user
         // wants the dynamic name back. Drop any saved label.
         if (name === '') {
@@ -115,6 +171,8 @@ function snapshotLabels(): Promise<void> {
         if (PROC_NAME_BLACKLIST.has(name)) continue;
         // Anything else is a real user rename (sticky via TitleEventSource.Api).
         if (current?.label !== name) {
+            const hex = Array.from(name).map(c => c.codePointAt(0)!.toString(16).padStart(4, '0')).join(' ');
+            log(`snapshotLabels: persisting ${sName} label="${name}" hex=${hex} prev=${current?.label ?? '-'}`);
             writes.push(setMeta(sName, { ...current, label: name }));
         }
     }
@@ -129,6 +187,12 @@ function snapshotLocations(): Promise<void> {
         for (let i = 0; i < group.tabs.length; i++) {
             const tab = group.tabs[i];
             if (!(tab.input instanceof vscode.TabInputTerminal)) continue;
+            // Skip empty-label matches: a freshly-created editor terminal can
+            // have tab.label === "" momentarily before its title settles, and
+            // a freshly-created panel terminal can have t.name === "" at the
+            // same moment. The accidental "" === "" match wrongly classifies
+            // the panel terminal as being in this editor group.
+            if (!tab.label) continue;
             for (const t of vscode.window.terminals) {
                 const sName = sessionNameOf(t);
                 if (!sName) continue;
@@ -158,14 +222,59 @@ function snapshotLocations(): Promise<void> {
         if (!sName) continue;
         const target = inEditor.get(sName);
         const current = getMeta(sName);
+        // Freshly-created editor terminals (e.g. from reconnectAll with
+        // location: {viewColumn}) take an event-loop tick or two to show up
+        // in tabGroups.all. If we just used `target` here, those terminals
+        // would temporarily get viewColumn=undefined written (= panel
+        // classification), which then makes onDidChangeActiveTerminal wrongly
+        // classify the now-active editor terminal as panel and overwrite
+        // panel-active. Cross-check creationOptions.location: if the terminal
+        // was launched into the editor area, preserve its editor
+        // classification until tabGroups picks it up.
+        const co = t.creationOptions as vscode.TerminalOptions;
+        const createdInEditor = typeof co?.location === 'object'
+            && co.location !== null
+            && 'viewColumn' in co.location
+            && typeof co.location.viewColumn === 'number';
+        let nextViewColumn: number | undefined;
+        let nextTabIndex: number | undefined;
+        let nextPanelIndex: number | undefined;
+        if (target) {
+            nextViewColumn = target.viewColumn;
+            nextTabIndex = target.tabIndex;
+        } else if (createdInEditor) {
+            nextViewColumn = current?.viewColumn ?? (co.location as vscode.TerminalEditorLocationOptions).viewColumn;
+            nextTabIndex = current?.tabIndex;
+        } else {
+            nextPanelIndex = panelOrder.get(sName);
+        }
         const next: SessionMeta = {
             ...current,
-            viewColumn: target?.viewColumn,
-            tabIndex: target?.tabIndex,
-            panelIndex: target ? undefined : panelOrder.get(sName),
+            viewColumn: nextViewColumn,
+            tabIndex: nextTabIndex,
+            panelIndex: nextPanelIndex,
         };
         if (!metaEqual(current, next)) {
             writes.push(setMeta(sName, next));
+            // If this session transitioned from panel to editor (e.g., user
+            // dragged the tab from the terminal panel into the editor area),
+            // the panel-active key may still point at it from before the
+            // move. Clear it so reattach doesn't try to restore a now-editor
+            // session as the panel's active tab.
+            if (current?.viewColumn === undefined && next.viewColumn !== undefined
+                && getPanelActive() === sName) {
+                log(`snapshotLocations: ${sName} moved panel->editor, clearing panel-active`);
+                writes.push(setPanelActive(undefined));
+            }
+            // Mirror: if a session moved out of an editor column (to panel
+            // or to a different column), clear the editor-active entry for
+            // the column it left.
+            if (current?.viewColumn !== undefined
+                && current.viewColumn !== next.viewColumn
+                && getEditorActive(current.viewColumn) === sName) {
+                log(`snapshotLocations: ${sName} left editor col ${current.viewColumn}, clearing editor-active`);
+                writes.push(setEditorActive(current.viewColumn, undefined));
+            }
         }
     }
     // Active terminal -- a flat workspaceState key, not per-session.
@@ -202,11 +311,23 @@ function pruneStaleMeta(liveSessionNames: Set<string>): void {
             void activeCtx.workspaceState.update(key, undefined);
         }
     }
-    // Drop the saved-active key too if it points at a dead session, so reattach
-    // doesn't try to focus a nonexistent terminal.
+    // Drop the saved-active and panel-active keys if they point at dead
+    // sessions, so reattach doesn't try to focus a nonexistent terminal.
     const active = getActive();
     if (active && !liveSessionNames.has(active)) {
         void setActive(undefined);
+    }
+    const panelActive = getPanelActive();
+    if (panelActive && !liveSessionNames.has(panelActive)) {
+        void setPanelActive(undefined);
+    }
+    // Drop per-editor-column active entries that point at dead sessions.
+    for (const key of activeCtx.workspaceState.keys()) {
+        if (!key.startsWith(EDITOR_ACTIVE_PREFIX)) continue;
+        const value = activeCtx.workspaceState.get<string>(key);
+        if (value && !liveSessionNames.has(value)) {
+            void activeCtx.workspaceState.update(key, undefined);
+        }
     }
 }
 
@@ -531,6 +652,12 @@ async function reconnectAll(
     _ctx: vscode.ExtensionContext,
     opts?: { interactive?: boolean },
 ): Promise<void> {
+    await reconnectAllInner(opts);
+}
+
+async function reconnectAllInner(
+    opts?: { interactive?: boolean },
+): Promise<void> {
     refreshManagedSockets();
     const tag = workspaceTag();
     if (!tag) {
@@ -544,6 +671,12 @@ async function reconnectAll(
     const prefix = `vscode-${tag}-`;
     const live = await fetchDaemonSessions();
     log(`reconnectAll: live=${live === undefined ? 'undefined (daemon unreachable)' : JSON.stringify(live.names)}`);
+    if (live) {
+        for (const name of live.names.filter(n => n.startsWith(prefix))) {
+            const meta = getMeta(name);
+            if (meta) log(`reconnectAll: meta ${name} label=${JSON.stringify(meta.label ?? null)} viewColumn=${meta.viewColumn ?? '-'} tabIndex=${meta.tabIndex ?? '-'} panelIndex=${meta.panelIndex ?? '-'}`);
+        }
+    }
     if (live === undefined) {
         if (opts?.interactive) {
             vscode.window.showErrorMessage(
@@ -566,6 +699,23 @@ async function reconnectAll(
         vscode.window.terminals.map(sessionNameOf).filter((n): n is string => Boolean(n)),
     );
     const cwd = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    // Capture the saved active/panel-active/editor-active BEFORE we start
+    // creating terminals. VS Code auto-activates each new terminal as it's
+    // created, firing onDidChangeActiveTerminal, which writes those keys to
+    // whatever happens to be created last -- destroying the user's intended
+    // selection. We use these snapshots later for the show plan; the final
+    // shows then rewrite workspaceState back to the intended values.
+    const savedActive = getActive();
+    const savedPanelActive = getPanelActive();
+    const savedEditorActive = new Map<number, string>();
+    for (const name of ours) {
+        const meta = getMeta(name);
+        const col = meta?.viewColumn;
+        if (col === undefined) continue;
+        if (savedEditorActive.has(col)) continue;
+        const saved = getEditorActive(col);
+        if (saved) savedEditorActive.set(col, saved);
+    }
     // Sort to control creation order:
     //   - Panel sessions first, ordered by panelIndex so reattach preserves
     //     the user's panel tab order (or whatever they drag-reordered to).
@@ -619,14 +769,53 @@ async function reconnectAll(
             log(`reconnectAll: ${name} spawn ${pid !== undefined ? `pid=${pid}` : 'TIMEOUT'}`);
         }
     }
-    // Focus the saved-active terminal if it exists in this restore set;
-    // otherwise fall back to the first panel terminal so the panel pops open.
-    // preserveFocus on .show(true) keeps the active editor focused.
-    const savedActive = getActive();
+    // Reattach focus restoration. Two things to set:
+    //   - Panel-area: which terminal is the "selected tab" in the panel. The
+    //     panel itself needs to be revealed if there are panel terminals, even
+    //     if the globally-active terminal was an editor-area one.
+    //   - Global active: which terminal vscode.window.activeTerminal points at.
+    //     For a saved-editor active, this is distinct from the panel's tab.
+    // preserveFocus on .show(true) keeps the active editor focused throughout.
+    // Note: we use savedActive/savedPanelActive/savedEditorActive captured
+    // BEFORE the creation loop, since the auto-activations VS Code fires
+    // during creation overwrite the live workspaceState values.
     const activeEntry = savedActive ? created.find(e => e.name === savedActive) : undefined;
-    const finalShow = activeEntry ?? created.find(e => e.isPanel);
-    log(`reconnectAll: created=${JSON.stringify(created.map(e => ({name: e.name, isPanel: e.isPanel})))} savedActive=${savedActive ?? '-'} willFinalShow=${finalShow?.name ?? '-'}`);
-    finalShow?.t.show(true);
+    const panelEntry = (savedPanelActive
+        ? created.find(e => e.name === savedPanelActive && e.isPanel)
+        : undefined)
+        ?? created.find(e => e.isPanel);
+    // Per-editor-column saved-active selections. For each editor column we're
+    // restoring into, find the saved active session for that column. We show
+    // these first so each column ends with its prior selection; subsequent
+    // panel and global shows don't change other columns' active tabs.
+    const editorEntries: { col: number; entry: typeof created[number] }[] = [];
+    const seenCols = new Set<number>();
+    for (const entry of created) {
+        if (entry.isPanel) continue;
+        const meta = getMeta(entry.name);
+        const col = meta?.viewColumn;
+        if (col === undefined || seenCols.has(col)) continue;
+        seenCols.add(col);
+        const saved = savedEditorActive.get(col);
+        const match = saved ? created.find(e => e.name === saved) : undefined;
+        if (match) editorEntries.push({ col, entry: match });
+    }
+    log(`reconnectAll: created=${JSON.stringify(created.map(e => ({name: e.name, isPanel: e.isPanel})))} savedActive=${savedActive ?? '-'} savedPanelActive=${savedPanelActive ?? '-'} panelEntry=${panelEntry?.name ?? '-'} activeEntry=${activeEntry?.name ?? '-'} editor=${JSON.stringify(editorEntries.map(e => ({col: e.col, name: e.entry.name})))}`);
+    // Show each editor column's saved-active first so each column ends with
+    // the right tab selected. Skip the activeEntry's column -- the final
+    // show on it will set the column's active anyway.
+    for (const { entry } of editorEntries) {
+        if (entry === activeEntry) continue;
+        entry.t.show(true);
+    }
+    // Show the panel entry next to reveal the panel and select its restored
+    // tab. Skip if it's the same as the global active.
+    if (panelEntry && panelEntry !== activeEntry) {
+        panelEntry.t.show(true);
+    }
+    // Final show makes the saved-active the globally focused terminal; falls
+    // back to the panel entry (or undefined if no terminals at all).
+    (activeEntry ?? panelEntry)?.t.show(true);
 }
 
 // Race Terminal.processId against a timeout. Returns the resolved PID, or
@@ -783,6 +972,29 @@ export function activate(ctx: vscode.ExtensionContext): void {
             log(`activeTerminal changed: name=${active?.name ?? '(none)'} session=${activeName ?? '-'}`);
             if (activeName !== undefined && getActive() !== activeName) {
                 void setActive(activeName);
+            }
+            // Track the most recent panel-area dterm as the "panel active"
+            // separately. snapshotLocations classifies panel vs editor by
+            // meta.viewColumn; we mirror that here so reattach can restore
+            // both the globally-active terminal and the panel's selected tab.
+            // Important: require meta to be DEFINED before classifying. During
+            // rapid terminal creation, snapshotLocations may not have
+            // populated meta yet -- treating "no meta" as "panel" would
+            // wrongly overwrite panelActive with editor terminals.
+            if (activeName !== undefined) {
+                const meta = getMeta(activeName);
+                if (meta !== undefined && meta.viewColumn === undefined
+                    && getPanelActive() !== activeName) {
+                    void setPanelActive(activeName);
+                }
+                // Mirror logic for per-editor-column active: when an editor-
+                // area dterm becomes active, record it as the active tab in
+                // its column so reattach can restore the column's selection
+                // independently of the global active terminal.
+                if (meta?.viewColumn !== undefined
+                    && getEditorActive(meta.viewColumn) !== activeName) {
+                    void setEditorActive(meta.viewColumn, activeName);
+                }
             }
         }),
         vscode.window.onDidOpenTerminal(t => {
