@@ -19,6 +19,37 @@ const PROFILE_ID = 'dterm.profile';
 // ours, a t.name without it is a user inline-rename. Invisible in the UI.
 const FG_NAME_MARKER = '​';
 
+// Encode an ASCII session name into Unicode tag characters (U+E0020-U+E007E),
+// which map U+0020-U+007E one-to-one to invisible code points. Appended after
+// FG_NAME_MARKER on every name we set, so tab.label carries the session ID
+// directly -- snapshotLocations can then decode it and identify which dterm
+// session a tab represents without any name-collision-prone label matching.
+function encodeSessionTag(s: string): string {
+    let out = '';
+    for (let i = 0; i < s.length; i++) {
+        const c = s.charCodeAt(i);
+        if (c >= 0x20 && c <= 0x7E) {
+            out += String.fromCodePoint(0xE0000 + c);
+        }
+    }
+    return out;
+}
+
+function decodeSessionTag(s: string): string {
+    let out = '';
+    for (const ch of s) {
+        const cp = ch.codePointAt(0);
+        if (cp !== undefined && cp >= 0xE0020 && cp <= 0xE007E) {
+            out += String.fromCharCode(cp - 0xE0000);
+        }
+    }
+    return out;
+}
+
+function nameWithSession(visible: string, sessionName: string): string {
+    return `${visible}${FG_NAME_MARKER}${encodeSessionTag(sessionName)}`;
+}
+
 let activeCtx: vscode.ExtensionContext | undefined;
 let logChannel: vscode.OutputChannel | undefined;
 let daemonLogChannel: vscode.OutputChannel | undefined;
@@ -160,18 +191,55 @@ const terminalToSession = new WeakMap<vscode.Terminal, string>();
 const ptyBySession = new Map<string, DtermPseudoterminal>();
 
 // Session names that snapshotLocations has confirmed in tabGroups (i.e.
-// label-matched into an editor-area tab) at least once. The
+// resolved to an editor-area tab via getSessionFromTab) at least once. The
 // creationOptions.location-based cross-check is only used while this set
 // doesn't yet contain the session -- otherwise a user dragging a previously
 // editor-area terminal into the panel would forever stay classified as
 // editor (creationOptions never updates).
 const everSeenInEditor = new Set<string>();
 
-function normalizeTabLabel(s: string): string {
-    // Strip the U+200B marker we append to every name we fire via
-    // onDidChangeName. VS Code's tab.label may or may not preserve zero-width
-    // characters in display, so we strip from both sides before comparing.
-    return s.replace(/​/g, '');
+// Stable mapping from editor-area Tab to dterm session name. Populated by
+// getSessionFromTab on first observation (decoding the tag-encoded session
+// ID embedded in the name we set on the terminal). Once cached, survives
+// renames, drags between editor columns, and process-name changes -- the
+// Tab object reference is stable across all of these, and a user inline-
+// rename only wipes the encoding from t.name / tab.label, not the cached
+// mapping. WeakMap so closed-tab entries clean up automatically.
+const tabToSession = new WeakMap<vscode.Tab, string>();
+
+function getSessionFromTab(tab: vscode.Tab): string | undefined {
+    const cached = tabToSession.get(tab);
+    if (cached !== undefined) return cached;
+    if (!(tab.input instanceof vscode.TabInputTerminal)) return undefined;
+    // Primary mechanism: decode the tag-encoded session ID we appended to
+    // the name. Works for every dterm-owned terminal that hasn't been
+    // user-renamed since creation (the encoding is wiped from t.name /
+    // tab.label by Api-source title overrides).
+    const decoded = decodeSessionTag(tab.label);
+    if (decoded) {
+        tabToSession.set(tab, decoded);
+        everSeenInEditor.add(decoded);
+        return decoded;
+    }
+    // Fallback: tab.label has no encoding -> the terminal was user-renamed
+    // before we observed this tab (e.g., user renamed a panel terminal and
+    // then dragged it into an editor group). Strict label equality match.
+    // No normalization: an unrenamed dterm terminal currently showing the
+    // process name "bash" has t.name = "bash​<encoded>", which will
+    // not strict-equal "bash" -- so a user renaming a different terminal
+    // to "bash" can't cross-match an unrenamed sibling. The only collision
+    // is two terminals both user-renamed to the same exact string, which
+    // is genuine user ambiguity.
+    for (const t of vscode.window.terminals) {
+        const sName = sessionNameOf(t);
+        if (!sName) continue;
+        if (tab.label === t.name) {
+            tabToSession.set(tab, sName);
+            everSeenInEditor.add(sName);
+            return sName;
+        }
+    }
+    return undefined;
 }
 
 function snapshotLabels(): Promise<void> {
@@ -222,29 +290,19 @@ function snapshotLabels(): Promise<void> {
 }
 
 function snapshotLocations(): Promise<void> {
-    // Find editor-area terminals via tabGroups. Terminals in the panel are absent
-    // from tabGroups entirely and end up with viewColumn=undefined.
+    // Find editor-area terminals via tabGroups. Terminals in the panel are
+    // absent from tabGroups entirely and end up with viewColumn=undefined.
+    // Mapping from tab to session is done via getSessionFromTab, which
+    // decodes the tag-encoded session ID we embed in every name we set --
+    // no name-collision-prone label iteration. The WeakMap inside
+    // getSessionFromTab caches the mapping so renames don't break it.
     const inEditor = new Map<string, { viewColumn: number; tabIndex: number }>();
     for (const group of vscode.window.tabGroups.all) {
         for (let i = 0; i < group.tabs.length; i++) {
             const tab = group.tabs[i];
-            if (!(tab.input instanceof vscode.TabInputTerminal)) continue;
-            // Skip empty-label matches: a freshly-created editor terminal can
-            // have tab.label === "" momentarily before its title settles, and
-            // a freshly-created panel terminal can have t.name === "" at the
-            // same moment. The accidental "" === "" match wrongly classifies
-            // the panel terminal as being in this editor group.
-            if (!tab.label) continue;
-            const labelKey = normalizeTabLabel(tab.label);
-            if (!labelKey) continue;
-            for (const t of vscode.window.terminals) {
-                const sName = sessionNameOf(t);
-                if (!sName) continue;
-                if (normalizeTabLabel(t.name) === labelKey) {
-                    inEditor.set(sName, { viewColumn: group.viewColumn, tabIndex: i });
-                    everSeenInEditor.add(sName);
-                    break;
-                }
+            const sName = getSessionFromTab(tab);
+            if (sName) {
+                inEditor.set(sName, { viewColumn: group.viewColumn, tabIndex: i });
             }
         }
     }
@@ -799,10 +857,13 @@ class DtermPseudoterminal implements vscode.Pseudoterminal {
     private handleProcessName(name: string): void {
         this.lastProcessNameSeen = name;
         if (this.nameLocked) return;
-        // Append the marker so detectAndLockUserRename can later tell our
-        // fires apart from user inline-renames. The marker is U+200B (zero-
-        // width space) so it's invisible in the tab UI.
-        const marked = name + FG_NAME_MARKER;
+        // Append the marker AND the tag-encoded session ID. The marker lets
+        // detectAndLockUserRename tell our fires apart from user inline-
+        // renames; the encoded session ID lets getSessionFromTab recover
+        // which dterm session this tab represents without relying on label
+        // matching (which collides for terminals sharing a process name).
+        // Both are invisible in the tab UI.
+        const marked = nameWithSession(name, this.sessionName);
         this.nameEmitter.fire(marked);
         this.lastFiredName = marked;
     }
@@ -815,7 +876,7 @@ class DtermPseudoterminal implements vscode.Pseudoterminal {
         this.nameLocked = false;
         this.lastFiredName = undefined;
         if (this.lastProcessNameSeen) {
-            const marked = this.lastProcessNameSeen + FG_NAME_MARKER;
+            const marked = nameWithSession(this.lastProcessNameSeen, this.sessionName);
             this.nameEmitter.fire(marked);
             this.lastFiredName = marked;
         }
@@ -952,12 +1013,15 @@ function buildPseudoOptions(
     const pty = new DtermPseudoterminal(sessionName, label, initialDims, bootstrap);
     ptyBySession.set(sessionName, pty);
     return {
-        // Marker on the default name so the brief window between createTerminal
-        // and our first onDidChangeName fire doesn't look like an unmarked
-        // user value to detectAndLockUserRename. Restored labels (user-set
-        // before) are kept verbatim; the constructor locks on them anyway, so
-        // the marker check never runs.
-        name: label ?? `dterm${FG_NAME_MARKER}`,
+        // Default name carries the marker + tag-encoded session ID so the
+        // brief window between createTerminal and our first onDidChangeName
+        // fire still has tab.label carrying our identifier. Without it, a
+        // snapshotLocations call inside that window would fail to map the
+        // tab via getSessionFromTab (no encoding present, fallback label
+        // match would have nothing to match against). Restored user labels
+        // are kept verbatim; the constructor locks on them, and the
+        // getSessionFromTab fallback handles them via strict label match.
+        name: label ?? nameWithSession('dterm', sessionName),
         pty,
         iconPath: activeCtx
             ? {
@@ -1323,6 +1387,11 @@ async function reconnectAll(
     // Final show makes the saved-active the globally focused terminal; falls
     // back to the panel entry (or undefined if no terminals at all).
     (activeEntry ?? panelEntry)?.t.show(true);
+    // Defer a tab-state dump so onDidChangeTabs has a chance to settle after
+    // the final show() calls above. Useful for confirming what tab.label
+    // looks like for dterm editor-area tabs (e.g. whether the U+200B marker
+    // we fire on names survives into tab.label).
+    setTimeout(() => logTabGroupsState('post-reconnect'), 500);
 }
 
 // Diagnostic: compare the env of the active dterm's daemon-side shell to
@@ -1469,6 +1538,10 @@ function truncate(s: string, n: number): string {
 // what the public API actually surfaces -- specifically whether aux-window tab
 // groups are visible (with what viewColumn) and how aux-window terminals appear
 // in vscode.window.terminals.
+function hexCodepoints(s: string): string {
+    return Array.from(s).map(c => c.codePointAt(0)!.toString(16).padStart(4, '0')).join(' ');
+}
+
 function logTabGroupsState(tag: string): void {
     try {
         const groups = vscode.window.tabGroups.all.map(g => ({
@@ -1476,11 +1549,13 @@ function logTabGroupsState(tag: string): void {
             isActive: g.isActive,
             tabs: g.tabs.map(t => ({
                 label: t.label,
+                labelHex: hexCodepoints(t.label),
                 inputType: t.input?.constructor?.name ?? 'undefined',
             })),
         }));
         const terms = vscode.window.terminals.map(t => ({
             name: t.name,
+            nameHex: hexCodepoints(t.name),
             session: sessionNameOf(t) ?? '-',
         }));
         const active = vscode.window.activeTerminal
