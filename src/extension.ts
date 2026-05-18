@@ -576,14 +576,27 @@ function updateSymlinkAtomic(target: string, linkPath: string): boolean {
     }
 }
 
-function refreshManagedSockets(): Record<string, string> {
+// Refresh the workspace-scoped symlinks that indirect rotating client sockets
+// (SSH_AUTH_SOCK, VSCODE_GIT_IPC_HANDLE) so daemon-side shells stay valid
+// across reconnect. Reads upstream values from the supplied envSource and
+// falls back to process.env if a value isn't there.
+//
+// At activation / reconnectAll time, only process.env is available -- it's
+// sufficient for SSH_AUTH_SOCK (set by sshd on the extension host) but not
+// for VSCODE_GIT_IPC_HANDLE (contributed by the git extension's
+// EnvironmentVariableCollection, which only applies at terminal-spawn time
+// and never lands in the extension host's own env). At new-session spawn
+// time, the bootstrap stub's captured env carries the EVC contributions, so
+// passing it in lets us pick up VSCODE_GIT_IPC_HANDLE and similar EVC-only
+// values.
+function refreshManagedSockets(envSource?: Record<string, string>): Record<string, string> {
     const overrides: Record<string, string> = {};
     const tag = workspaceTag();
     if (!tag) return overrides;
     const dir = agentDir(tag);
     let dirEnsured = false;
     for (const m of MANAGED_SOCKETS) {
-        const upstream = process.env[m.envVar];
+        const upstream = envSource?.[m.envVar] ?? process.env[m.envVar];
         if (!upstream) continue;
         if (!dirEnsured) {
             try {
@@ -805,7 +818,13 @@ class DtermPseudoterminal implements vscode.Pseudoterminal {
             // the actual shell's env so they stay valid across reconnects
             // (refreshManagedSockets keeps the symlink target updated to the
             // current upstream).
-            Object.assign(env, refreshManagedSockets());
+            //
+            // Pass the bootstrap-captured env as the upstream source so
+            // values that only show up in EVC contributions (e.g.,
+            // VSCODE_GIT_IPC_HANDLE -- the git extension contributes it via
+            // EVC, and it never lands in the extension host's process.env)
+            // can also be symlink-indirected.
+            Object.assign(env, refreshManagedSockets(this.bootstrapResult.env));
             msg = {
                 type: 'open',
                 name: this.sessionName,
@@ -1444,10 +1463,11 @@ async function checkEnvFreshness(): Promise<void> {
     // sending env to the daemon: the visible terminal's spawn replaces
     // the raw upstream socket paths (SSH_AUTH_SOCK, VSCODE_GIT_IPC_HANDLE)
     // with our workspace-scoped symlink paths so reattached shells stay
-    // valid across reconnect. Without this mirror here, the diagnostic
-    // would report SSH_AUTH_SOCK as drift on every reconnect even though
-    // the actual spawn path normalizes it.
-    Object.assign(freshEnv, refreshManagedSockets());
+    // valid across reconnect. Pass freshResult.env so EVC-only contributions
+    // (like VSCODE_GIT_IPC_HANDLE from the git extension) get picked up;
+    // without that, refreshManagedSockets would skip them and the diagnostic
+    // would report them as drift.
+    Object.assign(freshEnv, refreshManagedSockets(freshResult.env));
     const ch = vscode.window.createOutputChannel('dterm: env freshness');
     renderEnvDiff(ch, sessionName, sessionEnv, freshEnv);
     ch.show(true);
