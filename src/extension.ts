@@ -159,6 +159,21 @@ function log(line: string): void {
 const terminalToSession = new WeakMap<vscode.Terminal, string>();
 const ptyBySession = new Map<string, DtermPseudoterminal>();
 
+// Session names that snapshotLocations has confirmed in tabGroups (i.e.
+// label-matched into an editor-area tab) at least once. The
+// creationOptions.location-based cross-check is only used while this set
+// doesn't yet contain the session -- otherwise a user dragging a previously
+// editor-area terminal into the panel would forever stay classified as
+// editor (creationOptions never updates).
+const everSeenInEditor = new Set<string>();
+
+function normalizeTabLabel(s: string): string {
+    // Strip the U+200B marker we append to every name we fire via
+    // onDidChangeName. VS Code's tab.label may or may not preserve zero-width
+    // characters in display, so we strip from both sides before comparing.
+    return s.replace(/​/g, '');
+}
+
 function snapshotLabels(): Promise<void> {
     const writes: Promise<void>[] = [];
     for (const t of vscode.window.terminals) {
@@ -220,11 +235,14 @@ function snapshotLocations(): Promise<void> {
             // same moment. The accidental "" === "" match wrongly classifies
             // the panel terminal as being in this editor group.
             if (!tab.label) continue;
+            const labelKey = normalizeTabLabel(tab.label);
+            if (!labelKey) continue;
             for (const t of vscode.window.terminals) {
                 const sName = sessionNameOf(t);
                 if (!sName) continue;
-                if (tab.label === t.name) {
+                if (normalizeTabLabel(t.name) === labelKey) {
                     inEditor.set(sName, { viewColumn: group.viewColumn, tabIndex: i });
+                    everSeenInEditor.add(sName);
                     break;
                 }
             }
@@ -251,13 +269,19 @@ function snapshotLocations(): Promise<void> {
         const current = getMeta(sName);
         // Freshly-created editor terminals (e.g. from reconnectAll with
         // location: {viewColumn}) take an event-loop tick or two to show up
-        // in tabGroups.all. If we just used `target` here, those terminals
-        // would temporarily get viewColumn=undefined written (= panel
-        // classification), which then makes onDidChangeActiveTerminal wrongly
-        // classify the now-active editor terminal as panel and overwrite
-        // panel-active. Cross-check creationOptions.location: if the terminal
-        // was launched into the editor area, preserve its editor
-        // classification until tabGroups picks it up.
+        // in tabGroups.all. Without compensation, those terminals would
+        // briefly get viewColumn=undefined written (= panel classification),
+        // which lets onDidChangeActiveTerminal misclassify the now-active
+        // editor terminal as panel and overwrite panel-active.
+        //
+        // Cross-check: if the terminal was launched into the editor area AND
+        // we've never confirmed it via a tabGroups label-match, preserve the
+        // editor classification this tick (and the next, etc.) until
+        // tabGroups picks it up. The everSeenInEditor gate keeps this from
+        // sticking forever -- once a label-match has happened at least once
+        // for the session, subsequent absence from tabGroups means the user
+        // dragged it out (to the panel or a different surface), so we let it
+        // fall through to panel classification.
         const co = t.creationOptions as vscode.ExtensionTerminalOptions;
         const createdInEditor = typeof co?.location === 'object'
             && co.location !== null
@@ -269,7 +293,7 @@ function snapshotLocations(): Promise<void> {
         if (target) {
             nextViewColumn = target.viewColumn;
             nextTabIndex = target.tabIndex;
-        } else if (createdInEditor) {
+        } else if (createdInEditor && !everSeenInEditor.has(sName)) {
             nextViewColumn = current?.viewColumn ?? (co.location as vscode.TerminalEditorLocationOptions).viewColumn;
             nextTabIndex = current?.tabIndex;
         } else {
@@ -1671,6 +1695,10 @@ export function activate(ctx: vscode.ExtensionContext): void {
             // Drop the Pseudoterminal instance from our map so a subsequent
             // recreate of the same session gets a fresh DtermPseudoterminal.
             ptyBySession.delete(name);
+            // Drop the "have we seen this in editor" flag so a re-created
+            // session starts fresh (its first snapshot may need the
+            // creationOptions cross-check while tabGroups updates).
+            everSeenInEditor.delete(name);
             if (reason === vscode.TerminalExitReason.User) {
                 await daemonKill(name);
                 await setMeta(name, undefined);
