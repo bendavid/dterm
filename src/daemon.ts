@@ -240,10 +240,6 @@ function handleMessage(client: Client, msg: ClientMessage) {
             let session = sessions.get(msg.name);
             let created = false;
             if (!session) {
-                if (msg.cols === undefined || msg.rows === undefined) {
-                    send(client, { type: 'error', message: 'open requires cols/rows for a new session' });
-                    return;
-                }
                 session = createSession(msg.name, msg.cols, msg.rows, {
                     cwd: msg.cwd,
                     env: msg.env,
@@ -251,12 +247,7 @@ function handleMessage(client: Client, msg: ClientMessage) {
                     shellArgs: msg.shellArgs,
                 });
                 created = true;
-            } else if (msg.cols !== undefined && msg.rows !== undefined) {
-                // Reattach with explicit dims: caller asserts these are correct,
-                // so resize the pty + emulator if they differ. Reattachers that
-                // don't yet know the real dims (e.g. a Pseudoterminal that hasn't
-                // had open() called) should omit them and follow up with a
-                // separate `resize` once they have them.
+            } else {
                 if (msg.cols !== session.cols || msg.rows !== session.rows) {
                     try {
                         session.pty.resize(Math.max(1, msg.cols), Math.max(1, msg.rows));
