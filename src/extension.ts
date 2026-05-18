@@ -1440,6 +1440,14 @@ async function checkEnvFreshness(): Promise<void> {
     delete freshEnv.DTERM_BOOTSTRAP_SOCKET;
     delete freshEnv.DTERM_SESSION;
     delete freshEnv.DTERM_REAL_SHELL;
+    // Mirror the override we apply in Pseudoterminal.connect() before
+    // sending env to the daemon: the visible terminal's spawn replaces
+    // the raw upstream socket paths (SSH_AUTH_SOCK, VSCODE_GIT_IPC_HANDLE)
+    // with our workspace-scoped symlink paths so reattached shells stay
+    // valid across reconnect. Without this mirror here, the diagnostic
+    // would report SSH_AUTH_SOCK as drift on every reconnect even though
+    // the actual spawn path normalizes it.
+    Object.assign(freshEnv, refreshManagedSockets());
     const ch = vscode.window.createOutputChannel('dterm: env freshness');
     renderEnvDiff(ch, sessionName, sessionEnv, freshEnv);
     ch.show(true);
