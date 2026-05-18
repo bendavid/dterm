@@ -684,33 +684,52 @@ class DtermPseudoterminal implements vscode.Pseudoterminal {
     private openResolve?: () => void;
     readonly openPromise: Promise<void> = new Promise(r => { this.openResolve = r; });
 
+    // Held so close() can dispose the kept-alive stub Terminal whenever the
+    // bootstrap promise resolves -- including the case where close() is
+    // called before the bootstrap finishes (rapid create-then-close).
+    private readonly bootstrapPromise: Promise<BootstrapResult>;
+
     constructor(
         public readonly sessionName: string,
         restoredLabel: string | undefined,
         initialDims: { cols: number; rows: number },
-        bootstrap: Promise<BootstrapResult> | undefined,
+        bootstrap: Promise<BootstrapResult>,
+        isReattach: boolean,
     ) {
         this.cols = initialDims.cols;
         this.rows = initialDims.rows;
         this.nameLocked = restoredLabel !== undefined;
         this.lastFiredName = restoredLabel;
-        this.isReattach = bootstrap === undefined;
-        if (bootstrap === undefined) {
-            // Reattach -- no env to capture, daemon-side shell already exists.
+        this.isReattach = isReattach;
+        this.bootstrapPromise = bootstrap;
+        if (isReattach) {
+            // Daemon-side shell already exists; don't gate connect on the
+            // bootstrap. We still hold the promise so close() can dispose
+            // the kept-alive stub Terminal once it spawns.
             this.bootstrapDone = true;
-        } else {
-            bootstrap.then(
-                result => {
-                    this.bootstrapResult = result;
+        }
+        bootstrap.then(
+            result => {
+                this.bootstrapResult = result;
+                if (!isReattach) {
                     this.bootstrapDone = true;
                     this.tryConnect();
-                },
-                (e: Error) => {
+                }
+                // For reattach, bootstrapResult is recorded so close() can
+                // dispose result.stub; we don't use the captured env or args.
+            },
+            (e: Error) => {
+                if (!isReattach) {
                     this.pendingError = `dterm: failed to start shell: ${e.message}\r\n`;
                     if (this.opened) this.flushError();
-                },
-            );
-        }
+                } else {
+                    // Reattach without a fresh stub just means no live IPC
+                    // socket for `code` CLI; the dterm session itself
+                    // continues to work via the existing daemon connection.
+                    log(`bootstrap (reattach) failed for ${this.sessionName}: ${e.message}`);
+                }
+            },
+        );
     }
 
     private flushError(): void {
@@ -937,6 +956,16 @@ class DtermPseudoterminal implements vscode.Pseudoterminal {
             try { this.sock.end(); } catch { /* ignore */ }
             this.sock = undefined;
         }
+        // Dispose the kept-alive bootstrap stub. Resolving via the stored
+        // promise handles both cases: bootstrap already completed (dispose
+        // immediately) and bootstrap still in flight (dispose when it
+        // resolves, so a fast close-during-bootstrap doesn't leak).
+        void this.bootstrapPromise.then(
+            result => {
+                try { result.stub.dispose(); } catch { /* already gone */ }
+            },
+            () => { /* bootstrap failed; no stub to dispose */ },
+        );
     }
 }
 
@@ -967,11 +996,18 @@ function stubPathForShell(shellBinary: string): { stubPath: string; shimName: st
 // Bootstrap captures what VS Code would inject into a real terminal -- the
 // resolved env (including shell-integration --init-file path, VSCODE_INJECTION,
 // VSCODE_SHELL_INTEGRATION_NONCE, etc.) and the argv that VS Code launched
-// the stub with. The visible Pseudoterminal then hands this to the daemon in
-// its `open` message so the daemon-side shell spawns with the right env.
+// the stub with. The visible Pseudoterminal hands this to the daemon in its
+// `open` message so the daemon-side shell spawns with the right env.
+//
+// Also carries the stub Terminal itself. The stub is kept alive (no longer
+// exits after writing its payload) so VS Code's per-terminal IPC socket --
+// whose path is captured in env.VSCODE_IPC_HOOK_CLI -- remains bound for the
+// lifetime of the dterm session. The Pseudoterminal disposes the stub in its
+// close() handler.
 interface BootstrapResult {
     env: Record<string, string>;
     args: string[];
+    stub: vscode.Terminal;
 }
 
 // Options for the hidden bootstrap stub: a real shell terminal whose only
@@ -1017,19 +1053,21 @@ function buildBootstrapStubOptions(
 
 // Options for the visible Pseudoterminal-backed terminal that the user
 // interacts with. Connects directly to the daemon via a Unix socket and
-// forwards stdio. For new sessions, `bootstrap` is a promise resolving to
-// the captured env+argv that gets included in the daemon's `open` message
-// (so the shell spawns with VS Code's shell-integration env). For reattach,
-// pass `undefined` -- the daemon-side shell already exists and we just
-// attach with name + dims.
+// forwards stdio. `bootstrap` is always provided: for new sessions, its
+// captured env+argv get included in the daemon's `open` message; for
+// reattach, only its kept-alive stub Terminal is used (to keep the
+// per-session VS Code IPC socket bound) -- the captured env/argv go
+// unused because the daemon-side shell already exists. `isReattach`
+// tells the Pseudoterminal which of the two it is.
 function buildPseudoOptions(
     sessionName: string,
     label: string | undefined,
     viewColumn: number | undefined,
     initialDims: { cols: number; rows: number },
-    bootstrap: Promise<BootstrapResult> | undefined,
+    bootstrap: Promise<BootstrapResult>,
+    isReattach: boolean,
 ): vscode.ExtensionTerminalOptions {
-    const pty = new DtermPseudoterminal(sessionName, label, initialDims, bootstrap);
+    const pty = new DtermPseudoterminal(sessionName, label, initialDims, bootstrap, isReattach);
     ptyBySession.set(sessionName, pty);
     return {
         // Default name carries the marker + tag-encoded session ID so the
@@ -1125,10 +1163,11 @@ function setupBootstrapSocket(sessionName: string): {
 
 // Spawn the hidden bootstrap stub through VS Code's terminal pipeline so it
 // inherits shell-integration env, wait for it to write the captured env+argv
-// to the per-session bootstrap socket, and return the result. The visible
-// Pseudoterminal hands this to the daemon as part of its `open` message so
-// the daemon-side shell spawns with VS Code's shell-integration env --
-// without the stub ever talking to the daemon.
+// to the per-session bootstrap socket, and return the result -- including
+// the stub Terminal itself, which stays alive after the payload is captured.
+// The Pseudoterminal owns the stub from that point and disposes it on close.
+// Keeping the stub alive preserves the bind on VS Code's per-terminal IPC
+// socket (VSCODE_IPC_HOOK_CLI) for the lifetime of the dterm session.
 async function bootstrapShell(sessionName: string, cwd?: string): Promise<BootstrapResult> {
     const { sockPath, cleanup, payload } = setupBootstrapSocket(sessionName);
     const stub = vscode.window.createTerminal(buildBootstrapStubOptions(sessionName, sockPath, cwd));
@@ -1145,8 +1184,13 @@ async function bootstrapShell(sessionName: string, cwd?: string): Promise<Bootst
         }, 10_000);
         const disposable = vscode.window.onDidCloseTerminal(t => {
             if (t !== stub) return;
-            // Stub exit before payload means the socket write failed. The
-            // payload promise will reject (or has already), so we let it.
+            // Stub exit before payload means the socket write failed (or
+            // the stub crashed). The payload promise will reject (or has
+            // already), so we let it -- the reject() below handles cleanup.
+            // After payload is received, we transfer ownership of the stub
+            // Terminal to the Pseudoterminal; if it dies unexpectedly later
+            // the session's `code` CLI just degrades to non-functional, but
+            // the rest of the dterm session keeps working.
             const code = t.exitStatus?.code ?? 0;
             if (code !== 0 && !resolved && !rejected) {
                 rejected = true;
@@ -1162,8 +1206,9 @@ async function bootstrapShell(sessionName: string, cwd?: string): Promise<Bootst
                 resolved = true;
                 clearTimeout(timeout);
                 disposable.dispose();
-                try { stub.dispose(); } catch { /* already gone */ }
-                resolve(result);
+                // Do NOT dispose the stub -- caller takes ownership and
+                // disposes it when the Pseudoterminal closes.
+                resolve({ ...result, stub });
             },
             err => {
                 if (resolved || rejected) return;
@@ -1330,11 +1375,21 @@ async function reconnectAll(
         }
         const meta = getMeta(name);
         log(`reconnectAll: creating terminal for ${name} (${meta?.viewColumn !== undefined ? `col ${meta.viewColumn} idx ${meta.tabIndex ?? 0}` : `panel idx ${meta?.panelIndex ?? '?'}`})`);
-        // No bootstrap on reattach: the daemon-side shell was already spawned
-        // (with VS Code's shell-integration env) the first time this session
-        // was created. We just attach with name + dims.
+        // Reattach: the daemon-side shell already exists, so we don't need
+        // env/argv from the bootstrap. We still spawn one (and keep it
+        // alive for the duration of the Pseudoterminal) purely to hold a
+        // bound VS Code per-session IPC socket via VSCODE_IPC_HOOK_CLI --
+        // the daemon-side shell's env isn't refreshed to point at it (a
+        // future symlink-managed handoff would be needed for that), but
+        // having the stub alive is the precondition for any such future
+        // freshness mechanism.
+        const cwd = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+        const bootstrap = bootstrapShell(name, cwd).catch(e => {
+            log(`reconnectAll: bootstrap (reattach) failed for ${name}: ${(e as Error).message}`);
+            throw e;
+        });
         const t = vscode.window.createTerminal(
-            buildPseudoOptions(name, meta?.label, meta?.viewColumn, { cols: 80, rows: 24 }, undefined),
+            buildPseudoOptions(name, meta?.label, meta?.viewColumn, { cols: 80, rows: 24 }, bootstrap, /*isReattach=*/true),
         );
         terminalToSession.set(t, name);
         const pty = ptyBySession.get(name);
@@ -1701,7 +1756,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
                     throw e;
                 });
                 return new vscode.TerminalProfile(
-                    buildPseudoOptions(sessionName, undefined, undefined, { cols: 80, rows: 24 }, bootstrapPromise),
+                    buildPseudoOptions(sessionName, undefined, undefined, { cols: 80, rows: 24 }, bootstrapPromise, /*isReattach=*/false),
                 );
             },
         }),
