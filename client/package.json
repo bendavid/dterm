@@ -1,0 +1,44 @@
+{
+  "name": "dterm-client",
+  "displayName": "dterm client companion",
+  "description": "Client-side state-storage proxy for dterm. Runs UI-side so each client gets independent terminal layouts when multiple clients connect to the same remote.",
+  "publisher": "local",
+  "version": "0.5.0",
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "extensionKind": [
+    "ui"
+  ],
+  "main": "./out/extension.js",
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "contributes": {
+    "commands": [
+      {
+        "command": "dterm-client.state.get",
+        "title": "dterm: Read client state (internal)"
+      },
+      {
+        "command": "dterm-client.state.update",
+        "title": "dterm: Write client state (internal)"
+      },
+      {
+        "command": "dterm-client.state.keys",
+        "title": "dterm: List client state keys (internal)"
+      }
+    ]
+  },
+  "scripts": {
+    "compile": "tsc -p ."
+  },
+  "devDependencies": {
+    "@types/node": "20.x",
+    "@types/vscode": "^1.90.0",
+    "typescript": "^5.4.0"
+  }
+}

@@ -18,9 +18,9 @@ let pollTimer: NodeJS.Timeout | undefined;
 const pendingFocus = new Set<string>();
 
 // Per-session UI metadata (label, editor-area location, panel order). Stored
-// in workspaceState under a client-specific key derived from vscode.env.machineId
-// so two laptops connecting to the same remote get independent layouts --
-// matching how VS Code's built-in terminal layout is local-to-client.
+// in the dterm-client UI companion's workspaceState, which lives in the
+// client's local user-data dir, so two laptops SSH-ing into the same remote
+// get independent layouts.
 interface SessionMeta {
     label?: string;
     viewColumn?: number;
@@ -31,80 +31,105 @@ interface SessionMeta {
     panelIndex?: number;
 }
 
+// In-process cache of the UI companion's workspaceState. Populated at activate
+// time via the three cross-host commands the companion registers. Read paths
+// hit the cache directly (synchronous, matches the old workspaceState shape);
+// write paths update the cache AND fire an async command to the companion to
+// persist client-side. Because the main extension is the only writer for these
+// keys, the cache never diverges -- no invalidation needed.
+const stateCache = new Map<string, unknown>();
+
+async function initState(): Promise<void> {
+    try {
+        const keys = await vscode.commands.executeCommand<string[]>('dterm-client.state.keys') ?? [];
+        for (const key of keys) {
+            // Defensive: if an event handler already wrote this key between
+            // activation and the hydration loop, don't clobber the fresh
+            // value with the stale companion-side value.
+            if (stateCache.has(key)) continue;
+            const value = await vscode.commands.executeCommand('dterm-client.state.get', key);
+            stateCache.set(key, value);
+        }
+        log(`initState: hydrated ${keys.length} keys from dterm-client`);
+    } catch (e) {
+        log(`initState: dterm-client unavailable (${(e as Error)?.message ?? e}); starting with empty cache`);
+    }
+}
+
+function stateGet<T>(key: string): T | undefined {
+    return stateCache.get(key) as T | undefined;
+}
+
+function stateUpdate(key: string, value: unknown): Promise<void> {
+    if (value === undefined) {
+        stateCache.delete(key);
+    } else {
+        stateCache.set(key, value);
+    }
+    return Promise.resolve(
+        vscode.commands.executeCommand('dterm-client.state.update', key, value),
+    ).then(() => undefined);
+}
+
+function stateKeys(): string[] {
+    return Array.from(stateCache.keys());
+}
+
 function metaKey(sessionName: string): string {
-    return `client.${vscode.env.machineId}.session.${sessionName}`;
+    return `session.${sessionName}`;
 }
 
-// Separate key for the focused-terminal session. Not per-session because at most
-// one terminal is active at a time; storing as a flat key avoids churn-y meta
-// updates across every session.
-function activeKey(): string {
-    return `client.${vscode.env.machineId}.active`;
-}
+const ACTIVE_KEY = 'active';
+const PANEL_ACTIVE_KEY = 'panel-active';
+const EDITOR_ACTIVE_PREFIX = 'editor-active.';
 
-// Tracks the most recent panel terminal that was the global active terminal.
-// Distinct from activeKey because a panel terminal still has a "selected tab"
-// state even when the global active is an editor-area terminal -- reattach
-// needs to restore both so the panel reopens at the right tab.
-function panelActiveKey(): string {
-    return `client.${vscode.env.machineId}.panel-active`;
+function editorActiveKey(viewColumn: number): string {
+    return `${EDITOR_ACTIVE_PREFIX}${viewColumn}`;
 }
 
 function getActive(): string | undefined {
-    if (!activeCtx) return undefined;
-    return activeCtx.workspaceState.get<string>(activeKey());
+    return stateGet<string>(ACTIVE_KEY);
 }
 
 async function setActive(sessionName: string | undefined): Promise<void> {
-    if (!activeCtx) return;
-    await activeCtx.workspaceState.update(activeKey(), sessionName);
+    await stateUpdate(ACTIVE_KEY, sessionName);
 }
 
+// Tracks the most recent panel terminal that was the global active terminal.
+// Distinct from ACTIVE_KEY because a panel terminal still has a "selected tab"
+// state even when the global active is an editor-area terminal -- reattach
+// needs to restore both so the panel reopens at the right tab.
 function getPanelActive(): string | undefined {
-    if (!activeCtx) return undefined;
-    return activeCtx.workspaceState.get<string>(panelActiveKey());
+    return stateGet<string>(PANEL_ACTIVE_KEY);
 }
 
 async function setPanelActive(sessionName: string | undefined): Promise<void> {
-    if (!activeCtx) return;
-    await activeCtx.workspaceState.update(panelActiveKey(), sessionName);
+    await stateUpdate(PANEL_ACTIVE_KEY, sessionName);
 }
 
-// Per-editor-column active session. Distinct from activeKey because each
+// Per-editor-column active session. Distinct from ACTIVE_KEY because each
 // editor group keeps its own selected tab independent of the global active
 // terminal -- reattach needs to restore each column to whichever dterm was
 // last selected there even when the global focus was elsewhere.
-function editorActiveKey(viewColumn: number): string {
-    return `client.${vscode.env.machineId}.editor-active.${viewColumn}`;
-}
-
-function editorActivePrefix(): string {
-    return `client.${vscode.env.machineId}.editor-active.`;
-}
-
 function getEditorActive(viewColumn: number): string | undefined {
-    if (!activeCtx) return undefined;
-    return activeCtx.workspaceState.get<string>(editorActiveKey(viewColumn));
+    return stateGet<string>(editorActiveKey(viewColumn));
 }
 
 async function setEditorActive(viewColumn: number, sessionName: string | undefined): Promise<void> {
-    if (!activeCtx) return;
-    await activeCtx.workspaceState.update(editorActiveKey(viewColumn), sessionName);
+    await stateUpdate(editorActiveKey(viewColumn), sessionName);
 }
 
 function getMeta(sessionName: string): SessionMeta | undefined {
-    if (!activeCtx) return undefined;
-    return activeCtx.workspaceState.get<SessionMeta>(metaKey(sessionName));
+    return stateGet<SessionMeta>(metaKey(sessionName));
 }
 
 async function setMeta(sessionName: string, meta: SessionMeta | undefined): Promise<void> {
-    if (!activeCtx) return;
     const empty = !meta || (
         meta.label === undefined
         && meta.viewColumn === undefined
         && meta.panelIndex === undefined
     );
-    await activeCtx.workspaceState.update(metaKey(sessionName), empty ? undefined : meta);
+    await stateUpdate(metaKey(sessionName), empty ? undefined : meta);
 }
 
 function metaEqual(a: SessionMeta | undefined, b: SessionMeta | undefined): boolean {
@@ -278,13 +303,12 @@ function ensurePolling(): void {
 }
 
 function pruneStaleMeta(liveSessionNames: Set<string>): void {
-    if (!activeCtx) return;
-    const prefix = `client.${vscode.env.machineId}.session.`;
-    for (const key of activeCtx.workspaceState.keys()) {
-        if (!key.startsWith(prefix)) continue;
-        const session = key.slice(prefix.length);
+    const sessionPrefix = 'session.';
+    for (const key of stateKeys()) {
+        if (!key.startsWith(sessionPrefix)) continue;
+        const session = key.slice(sessionPrefix.length);
         if (!liveSessionNames.has(session)) {
-            void activeCtx.workspaceState.update(key, undefined);
+            void stateUpdate(key, undefined);
         }
     }
     // Drop the saved-active and panel-active keys if they point at dead
@@ -298,12 +322,11 @@ function pruneStaleMeta(liveSessionNames: Set<string>): void {
         void setPanelActive(undefined);
     }
     // Drop per-editor-column active entries that point at dead sessions.
-    const editorPrefix = editorActivePrefix();
-    for (const key of activeCtx.workspaceState.keys()) {
-        if (!key.startsWith(editorPrefix)) continue;
-        const value = activeCtx.workspaceState.get<string>(key);
+    for (const key of stateKeys()) {
+        if (!key.startsWith(EDITOR_ACTIVE_PREFIX)) continue;
+        const value = stateGet<string>(key);
         if (value && !liveSessionNames.has(value)) {
-            void activeCtx.workspaceState.update(key, undefined);
+            void stateUpdate(key, undefined);
         }
     }
 }
@@ -1421,6 +1444,11 @@ export function activate(ctx: vscode.ExtensionContext): void {
     );
 
     void (async () => {
+        // Hydrate the in-process state cache from the dterm-client UI
+        // companion BEFORE any code path reads it. Without this, snapshot
+        // polling, reconnectAll, and event handlers would see an empty cache
+        // and overwrite the persisted state.
+        await initState();
         logTabGroupsState('activate');
         const { restarted } = await checkDaemonVersion(ctx);
         if (restarted) return;
