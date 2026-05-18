@@ -140,6 +140,17 @@ export class DaemonConnection extends EventEmitter {
     }
 }
 
+// Ensure the daemon is running. Probes the socket and double-fork-spawns the
+// daemon if it isn't reachable. Resolves once the socket becomes connectable
+// (or rejects on timeout). Used by callers that need to connect a long-lived
+// socket directly (the Pseudoterminal-backed terminals) without going through
+// the request-response `oneShot` path.
+export async function ensureDaemon(daemonScript: string): Promise<void> {
+    const sockPath = socketPath();
+    if (await probeSocket(sockPath)) return;
+    await spawnDaemon(daemonScript);
+}
+
 export async function oneShot(
     daemonScript: string,
     send: ClientMessage,
