@@ -18,9 +18,6 @@
   "extensionKind": [
     "workspace"
   ],
-  "extensionDependencies": [
-    "local.dterm-client"
-  ],
   "main": "./out/extension.js",
   "activationEvents": [
     "onStartupFinished"
@@ -98,7 +95,7 @@
     }
   },
   "scripts": {
-    "compile": "tsc -p . && node scripts/postcompile.js && tsc -p ./client",
+    "compile": "tsc -p . && node scripts/postcompile.js",
     "watch": "tsc -p . -w",
     "clean-staged-prebuild": "rm -rf node_modules/node-pty/prebuilds/linux-x64 node_modules/node-pty/prebuilds/linux-arm64",
     "vscode:prepublish": "npm run compile"

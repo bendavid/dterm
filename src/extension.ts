@@ -11,6 +11,14 @@ import { encode, LineStream, type ClientMessage, type DaemonMessage } from './pr
 
 const PROFILE_ID = 'dterm.profile';
 
+// U+200B (zero-width space) appended to every name dterm sets on a terminal:
+// the default `name: 'dterm'` for unrenamed sessions in TerminalOptions, and
+// every onDidChangeName fire driven by daemon-side process-name polling. Lets
+// us distinguish "name dterm set" from "name the user typed" without any race-
+// prone comparison against lastFiredName: a t.name carrying the marker is
+// ours, a t.name without it is a user inline-rename. Invisible in the UI.
+const FG_NAME_MARKER = '​';
+
 let activeCtx: vscode.ExtensionContext | undefined;
 let logChannel: vscode.OutputChannel | undefined;
 let daemonLogChannel: vscode.OutputChannel | undefined;
@@ -18,9 +26,12 @@ let pollTimer: NodeJS.Timeout | undefined;
 const pendingFocus = new Set<string>();
 
 // Per-session UI metadata (label, editor-area location, panel order). Stored
-// in the dterm-client UI companion's workspaceState, which lives in the
-// client's local user-data dir, so two laptops SSH-ing into the same remote
-// get independent layouts.
+// in activeCtx.workspaceState (on the remote in SSH scenarios) under keys
+// prefixed with a per-client UUID so two laptops connecting to the same
+// remote keep independent terminal layouts. The UUID itself lives in
+// SecretStorage, which is the only stable VS Code API that proxies storage
+// to the local client side -- different clients get different UUIDs because
+// each client's local OS keystore is independent.
 interface SessionMeta {
     label?: string;
     viewColumn?: number;
@@ -31,105 +42,101 @@ interface SessionMeta {
     panelIndex?: number;
 }
 
-// In-process cache of the UI companion's workspaceState. Populated at activate
-// time via the three cross-host commands the companion registers. Read paths
-// hit the cache directly (synchronous, matches the old workspaceState shape);
-// write paths update the cache AND fire an async command to the companion to
-// persist client-side. Because the main extension is the only writer for these
-// keys, the cache never diverges -- no invalidation needed.
-const stateCache = new Map<string, unknown>();
+// Per-client scoping prefix. Minted on first activation, persisted via
+// SecretStorage so it survives reloads on the same client. Falls back to
+// vscode.env.machineId (remote-side, same across all clients) if SecretStorage
+// is unavailable -- degrades to "no per-client distinction" rather than
+// failing activation outright.
+let clientId: string = vscode.env.machineId;
 
-async function initState(): Promise<void> {
+async function ensureClientId(ctx: vscode.ExtensionContext): Promise<void> {
+    const KEY = 'dterm.clientId';
     try {
-        const keys = await vscode.commands.executeCommand<string[]>('dterm-client.state.keys') ?? [];
-        for (const key of keys) {
-            // Defensive: if an event handler already wrote this key between
-            // activation and the hydration loop, don't clobber the fresh
-            // value with the stale companion-side value.
-            if (stateCache.has(key)) continue;
-            const value = await vscode.commands.executeCommand('dterm-client.state.get', key);
-            stateCache.set(key, value);
+        let id = await ctx.secrets.get(KEY);
+        if (!id) {
+            id = crypto.randomUUID();
+            await ctx.secrets.store(KEY, id);
+            log(`ensureClientId: minted new clientId ${id}`);
+        } else {
+            log(`ensureClientId: restored clientId ${id}`);
         }
-        log(`initState: hydrated ${keys.length} keys from dterm-client`);
+        clientId = id;
     } catch (e) {
-        log(`initState: dterm-client unavailable (${(e as Error)?.message ?? e}); starting with empty cache`);
+        log(`ensureClientId: secrets unavailable (${(e as Error)?.message ?? e}); falling back to machineId ${vscode.env.machineId}`);
     }
-}
-
-function stateGet<T>(key: string): T | undefined {
-    return stateCache.get(key) as T | undefined;
-}
-
-function stateUpdate(key: string, value: unknown): Promise<void> {
-    if (value === undefined) {
-        stateCache.delete(key);
-    } else {
-        stateCache.set(key, value);
-    }
-    return Promise.resolve(
-        vscode.commands.executeCommand('dterm-client.state.update', key, value),
-    ).then(() => undefined);
-}
-
-function stateKeys(): string[] {
-    return Array.from(stateCache.keys());
 }
 
 function metaKey(sessionName: string): string {
-    return `session.${sessionName}`;
+    return `client.${clientId}.session.${sessionName}`;
 }
 
-const ACTIVE_KEY = 'active';
-const PANEL_ACTIVE_KEY = 'panel-active';
-const EDITOR_ACTIVE_PREFIX = 'editor-active.';
-
-function editorActiveKey(viewColumn: number): string {
-    return `${EDITOR_ACTIVE_PREFIX}${viewColumn}`;
-}
-
-function getActive(): string | undefined {
-    return stateGet<string>(ACTIVE_KEY);
-}
-
-async function setActive(sessionName: string | undefined): Promise<void> {
-    await stateUpdate(ACTIVE_KEY, sessionName);
+function activeKey(): string {
+    return `client.${clientId}.active`;
 }
 
 // Tracks the most recent panel terminal that was the global active terminal.
-// Distinct from ACTIVE_KEY because a panel terminal still has a "selected tab"
+// Distinct from activeKey because a panel terminal still has a "selected tab"
 // state even when the global active is an editor-area terminal -- reattach
 // needs to restore both so the panel reopens at the right tab.
-function getPanelActive(): string | undefined {
-    return stateGet<string>(PANEL_ACTIVE_KEY);
+function panelActiveKey(): string {
+    return `client.${clientId}.panel-active`;
 }
 
-async function setPanelActive(sessionName: string | undefined): Promise<void> {
-    await stateUpdate(PANEL_ACTIVE_KEY, sessionName);
-}
-
-// Per-editor-column active session. Distinct from ACTIVE_KEY because each
+// Per-editor-column active session. Distinct from activeKey because each
 // editor group keeps its own selected tab independent of the global active
 // terminal -- reattach needs to restore each column to whichever dterm was
 // last selected there even when the global focus was elsewhere.
+function editorActiveKey(viewColumn: number): string {
+    return `client.${clientId}.editor-active.${viewColumn}`;
+}
+
+function editorActivePrefix(): string {
+    return `client.${clientId}.editor-active.`;
+}
+
+function getActive(): string | undefined {
+    if (!activeCtx) return undefined;
+    return activeCtx.workspaceState.get<string>(activeKey());
+}
+
+async function setActive(sessionName: string | undefined): Promise<void> {
+    if (!activeCtx) return;
+    await activeCtx.workspaceState.update(activeKey(), sessionName);
+}
+
+function getPanelActive(): string | undefined {
+    if (!activeCtx) return undefined;
+    return activeCtx.workspaceState.get<string>(panelActiveKey());
+}
+
+async function setPanelActive(sessionName: string | undefined): Promise<void> {
+    if (!activeCtx) return;
+    await activeCtx.workspaceState.update(panelActiveKey(), sessionName);
+}
+
 function getEditorActive(viewColumn: number): string | undefined {
-    return stateGet<string>(editorActiveKey(viewColumn));
+    if (!activeCtx) return undefined;
+    return activeCtx.workspaceState.get<string>(editorActiveKey(viewColumn));
 }
 
 async function setEditorActive(viewColumn: number, sessionName: string | undefined): Promise<void> {
-    await stateUpdate(editorActiveKey(viewColumn), sessionName);
+    if (!activeCtx) return;
+    await activeCtx.workspaceState.update(editorActiveKey(viewColumn), sessionName);
 }
 
 function getMeta(sessionName: string): SessionMeta | undefined {
-    return stateGet<SessionMeta>(metaKey(sessionName));
+    if (!activeCtx) return undefined;
+    return activeCtx.workspaceState.get<SessionMeta>(metaKey(sessionName));
 }
 
 async function setMeta(sessionName: string, meta: SessionMeta | undefined): Promise<void> {
+    if (!activeCtx) return;
     const empty = !meta || (
         meta.label === undefined
         && meta.viewColumn === undefined
         && meta.panelIndex === undefined
     );
-    await stateUpdate(metaKey(sessionName), empty ? undefined : meta);
+    await activeCtx.workspaceState.update(metaKey(sessionName), empty ? undefined : meta);
 }
 
 function metaEqual(a: SessionMeta | undefined, b: SessionMeta | undefined): boolean {
@@ -160,21 +167,40 @@ function snapshotLabels(): Promise<void> {
         const pty = ptyBySession.get(sName);
         if (!pty) continue;
         const current = getMeta(sName);
-        // Inline tab rename to empty resolves t.name to '' for Pseudoterminals
-        // (because _processName -- the empty-rename fallback -- stays empty
-        // for extension-controlled terminals). Treat that as "user cleared
-        // the label": unlock the Pseudoterminal so daemon process_name updates
-        // drive the tab name again, and drop any saved label.
-        if (t.name === '') {
+        const name = t.name;
+        // Marker present -> the displayed name came from dterm (our default
+        // TerminalOptions.name or an onDidChangeName fire). Whether we're
+        // currently locked tells us how to interpret this:
+        //   - Locked: user previously inline-renamed, and now the marker
+        //     name is back. That can only mean the user cleared the rename
+        //     (VS Code fell back from the Api-source title to the
+        //     Process-source title, which is our last fire). Unlock so daemon
+        //     process_name updates drive the tab again, and drop the saved
+        //     label.
+        //   - Unlocked: normal dynamic-name operation. Nothing to do.
+        if (name.includes(FG_NAME_MARKER)) {
+            if (pty.isNameLocked()) {
+                pty.unlockName();
+                if (current?.label !== undefined) {
+                    writes.push(setMeta(sName, { ...current, label: undefined }));
+                }
+            }
+            continue;
+        }
+        // Empty rename can also resolve directly to '' on some VS Code paths
+        // (older behavior; kept as a defensive branch). Same semantics as
+        // marker-came-back-while-locked.
+        if (name === '') {
             pty.unlockName();
             if (current?.label !== undefined) {
                 writes.push(setMeta(sName, { ...current, label: undefined }));
             }
             continue;
         }
+        // No marker, non-empty -> user inline-renamed to a custom value.
         if (!pty.detectAndLockUserRename()) continue;
-        if (current?.label !== t.name) {
-            writes.push(setMeta(sName, { ...current, label: t.name }));
+        if (current?.label !== name) {
+            writes.push(setMeta(sName, { ...current, label: name }));
         }
     }
     return Promise.all(writes).then(() => undefined);
@@ -303,12 +329,13 @@ function ensurePolling(): void {
 }
 
 function pruneStaleMeta(liveSessionNames: Set<string>): void {
-    const sessionPrefix = 'session.';
-    for (const key of stateKeys()) {
+    if (!activeCtx) return;
+    const sessionPrefix = `client.${clientId}.session.`;
+    for (const key of activeCtx.workspaceState.keys()) {
         if (!key.startsWith(sessionPrefix)) continue;
         const session = key.slice(sessionPrefix.length);
         if (!liveSessionNames.has(session)) {
-            void stateUpdate(key, undefined);
+            void activeCtx.workspaceState.update(key, undefined);
         }
     }
     // Drop the saved-active and panel-active keys if they point at dead
@@ -322,11 +349,12 @@ function pruneStaleMeta(liveSessionNames: Set<string>): void {
         void setPanelActive(undefined);
     }
     // Drop per-editor-column active entries that point at dead sessions.
-    for (const key of stateKeys()) {
-        if (!key.startsWith(EDITOR_ACTIVE_PREFIX)) continue;
-        const value = stateGet<string>(key);
+    const editorPrefix = editorActivePrefix();
+    for (const key of activeCtx.workspaceState.keys()) {
+        if (!key.startsWith(editorPrefix)) continue;
+        const value = activeCtx.workspaceState.get<string>(key);
         if (value && !liveSessionNames.has(value)) {
-            void stateUpdate(key, undefined);
+            void activeCtx.workspaceState.update(key, undefined);
         }
     }
 }
@@ -606,17 +634,17 @@ class DtermPseudoterminal implements vscode.Pseudoterminal {
         this.term = t;
     }
 
-    // Returns true and locks future auto-updates if t.name has diverged from
-    // the last value we fired (or from the restored label). Called from
-    // handleProcessName and from snapshotLabels' polling loop.
+    // Returns true and locks future auto-updates if t.name lacks the U+200B
+    // marker dterm appends to every name it sets. Any unmarked value in t.name
+    // must have come from a user inline-rename (the only other path that
+    // writes to it). No comparison against lastFiredName needed -- the marker
+    // is a synchronous, race-free signal.
     detectAndLockUserRename(): boolean {
         if (this.nameLocked) return true;
         if (!this.term) return false;
-        if (this.lastFiredName !== undefined && this.term.name !== this.lastFiredName) {
-            this.nameLocked = true;
-            return true;
-        }
-        return false;
+        if (this.term.name.includes(FG_NAME_MARKER)) return false;
+        this.nameLocked = true;
+        return true;
     }
 
     open(initialDimensions: vscode.TerminalDimensions | undefined): void {
@@ -734,9 +762,13 @@ class DtermPseudoterminal implements vscode.Pseudoterminal {
 
     private handleProcessName(name: string): void {
         this.lastProcessNameSeen = name;
-        if (this.detectAndLockUserRename()) return;
-        this.nameEmitter.fire(name);
-        this.lastFiredName = name;
+        if (this.nameLocked) return;
+        // Append the marker so detectAndLockUserRename can later tell our
+        // fires apart from user inline-renames. The marker is U+200B (zero-
+        // width space) so it's invisible in the tab UI.
+        const marked = name + FG_NAME_MARKER;
+        this.nameEmitter.fire(marked);
+        this.lastFiredName = marked;
     }
 
     // Re-enable dynamic process-name updates after a user clears their custom
@@ -747,9 +779,19 @@ class DtermPseudoterminal implements vscode.Pseudoterminal {
         this.nameLocked = false;
         this.lastFiredName = undefined;
         if (this.lastProcessNameSeen) {
-            this.nameEmitter.fire(this.lastProcessNameSeen);
-            this.lastFiredName = this.lastProcessNameSeen;
+            const marked = this.lastProcessNameSeen + FG_NAME_MARKER;
+            this.nameEmitter.fire(marked);
+            this.lastFiredName = marked;
         }
+    }
+
+    // True if the lock that suppresses daemon-driven name updates is currently
+    // engaged. Exposed so snapshotLabels can detect "user cleared their inline
+    // rename" -- in that case t.name falls back from the user-set Api-source
+    // title to our marker-tagged Process-source title, and seeing the marker
+    // come back while we were locked is the signal to unlock.
+    isNameLocked(): boolean {
+        return this.nameLocked;
     }
 
     handleInput(data: string): void {
@@ -876,7 +918,12 @@ function buildPseudoOptions(
     const pty = new DtermPseudoterminal(sessionName, label, initialDims, bootstrap);
     ptyBySession.set(sessionName, pty);
     return {
-        name: label ?? 'dterm',
+        // Marker on the default name so the brief window between createTerminal
+        // and our first onDidChangeName fire doesn't look like an unmarked
+        // user value to detectAndLockUserRename. Restored labels (user-set
+        // before) are kept verbatim; the constructor locks on them anyway, so
+        // the marker check never runs.
+        name: label ?? `dterm${FG_NAME_MARKER}`,
         pty,
         iconPath: activeCtx
             ? {
@@ -1184,14 +1231,14 @@ async function reconnectAll(
         t.show(true);
         if (pty) {
             const timeoutMs = 5000;
-            await Promise.race([
-                pty.openPromise,
-                new Promise<void>(resolve => setTimeout(() => {
-                    log(`reconnectAll: open() did not fire within ${timeoutMs}ms for ${name}; continuing anyway`);
-                    resolve();
-                }, timeoutMs)),
-            ]);
-            log(`reconnectAll: open() fired (or timed out) for ${name}`);
+            let timedOut = false;
+            let timer: NodeJS.Timeout | undefined;
+            const timeoutPromise = new Promise<void>(resolve => {
+                timer = setTimeout(() => { timedOut = true; resolve(); }, timeoutMs);
+            });
+            await Promise.race([pty.openPromise, timeoutPromise]);
+            if (timer) clearTimeout(timer);
+            log(`reconnectAll: ${name} ${timedOut ? `open() timed out after ${timeoutMs}ms (continuing)` : 'open() fired'}`);
         }
         created.push({ name, t, isPanel: meta?.viewColumn === undefined });
     }
@@ -1610,11 +1657,11 @@ export function activate(ctx: vscode.ExtensionContext): void {
     );
 
     void (async () => {
-        // Hydrate the in-process state cache from the dterm-client UI
-        // companion BEFORE any code path reads it. Without this, snapshot
-        // polling, reconnectAll, and event handlers would see an empty cache
-        // and overwrite the persisted state.
-        await initState();
+        // Resolve clientId BEFORE any code path reads workspaceState -- every
+        // key derives from `client.${clientId}.<...>`, so reading with a
+        // fallback machineId-based prefix would miss values persisted under
+        // the real UUID.
+        await ensureClientId(ctx);
         logTabGroupsState('activate');
         const { restarted } = await checkDaemonVersion(ctx);
         if (restarted) return;
