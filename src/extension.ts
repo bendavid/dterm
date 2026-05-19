@@ -192,28 +192,40 @@ function getMeta(sessionName: string): SessionMeta | undefined {
     return { ...perClient, label };
 }
 
-async function setMeta(sessionName: string, meta: SessionMeta | undefined): Promise<void> {
+// Writes go through separate setters so position-only callers (the 2s
+// snapshotLocations poll) never touch the shared label store. With a single
+// combined setter, the natural `setMeta(sName, { ...current, viewColumn: ... })`
+// spread on client B would read B's in-memory label, which is stale relative
+// to a concurrent rename by client A (VS Code's workspaceState has no cross-
+// extension-host change notification -- each host has its own in-memory copy
+// and only sees its own writes during runtime). B's position snapshot would
+// then write its stale label back to the shared store, silently clobbering
+// A's recent rename on disk. Splitting the writers means position snapshots
+// only touch per-client keys, so the only path that writes the shared label
+// store is the explicit rename-detection path in snapshotLabels.
+async function setLabel(sessionName: string, label: string | undefined): Promise<void> {
     if (!activeCtx) return;
-    if (meta === undefined) {
-        await Promise.all([
-            activeCtx.workspaceState.update(metaKey(sessionName), undefined),
-            activeCtx.workspaceState.update(labelKey(sessionName), undefined),
-        ]);
-        return;
-    }
-    const { label, ...perClient } = meta;
-    const perClientEmpty = perClient.viewColumn === undefined
+    await activeCtx.workspaceState.update(labelKey(sessionName), label);
+}
+
+async function setPosition(sessionName: string, perClient: SessionMetaPerClient): Promise<void> {
+    if (!activeCtx) return;
+    const empty = perClient.viewColumn === undefined
         && perClient.tabIndex === undefined
         && perClient.panelIndex === undefined;
+    await activeCtx.workspaceState.update(metaKey(sessionName), empty ? undefined : perClient);
+}
+
+async function clearMeta(sessionName: string): Promise<void> {
+    if (!activeCtx) return;
     await Promise.all([
-        activeCtx.workspaceState.update(metaKey(sessionName), perClientEmpty ? undefined : perClient),
-        activeCtx.workspaceState.update(labelKey(sessionName), label),
+        activeCtx.workspaceState.update(metaKey(sessionName), undefined),
+        activeCtx.workspaceState.update(labelKey(sessionName), undefined),
     ]);
 }
 
-function metaEqual(a: SessionMeta | undefined, b: SessionMeta | undefined): boolean {
-    return (a?.label === b?.label)
-        && (a?.viewColumn === b?.viewColumn)
+function positionEqual(a: SessionMetaPerClient | undefined, b: SessionMetaPerClient | undefined): boolean {
+    return (a?.viewColumn === b?.viewColumn)
         && (a?.tabIndex === b?.tabIndex)
         && (a?.panelIndex === b?.panelIndex);
 }
@@ -298,7 +310,7 @@ function snapshotLabels(): Promise<void> {
         if (name === '') {
             pty.unlockName();
             if (current?.label !== undefined) {
-                writes.push(setMeta(sName, { ...current, label: undefined }));
+                writes.push(setLabel(sName, undefined));
             }
             continue;
         }
@@ -315,7 +327,7 @@ function snapshotLabels(): Promise<void> {
         // user's expressed preference.
         pty.applyUserLabel(name);
         if (current?.label !== name) {
-            writes.push(setMeta(sName, { ...current, label: name }));
+            writes.push(setLabel(sName, name));
         }
     }
     return Promise.all(writes).then(() => undefined);
@@ -389,14 +401,13 @@ function snapshotLocations(): Promise<void> {
         } else {
             nextPanelIndex = panelOrder.get(sName);
         }
-        const next: SessionMeta = {
-            ...current,
+        const next: SessionMetaPerClient = {
             viewColumn: nextViewColumn,
             tabIndex: nextTabIndex,
             panelIndex: nextPanelIndex,
         };
-        if (!metaEqual(current, next)) {
-            writes.push(setMeta(sName, next));
+        if (!positionEqual(current, next)) {
+            writes.push(setPosition(sName, next));
             // If this session transitioned from panel to editor (e.g., user
             // dragged the tab from the terminal panel into the editor area),
             // the panel-active key may still point at it from before the
@@ -1985,7 +1996,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
             everSeenInEditor.delete(name);
             if (reason === vscode.TerminalExitReason.User) {
                 await daemonKill(name);
-                await setMeta(name, undefined);
+                await clearMeta(name);
                 return;
             }
             // Window close / extension reload / process exit -- snapshot

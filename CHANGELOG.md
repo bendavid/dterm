@@ -14,6 +14,14 @@ connecting to the same remote workspace.
 - Last-write-wins on concurrent edits. Cross-client visibility shows
   up at the other client's next window reload; there is no live
   cross-extension-host change notification.
+- Position and label writes are routed through separate setters
+  (`setPosition` / `setLabel` / `clearMeta`) so the 2s position-snapshot
+  poll on one client cannot silently clobber a concurrent rename on
+  another client. Each VS Code extension host has its own in-memory
+  `workspaceState` copy and never observes another host's writes during
+  runtime, so a combined `setMeta` with a `{ ...current, viewColumn }`
+  spread would have written stale label values back to the shared store
+  on every position change.
 - "dterm: Clear persisted layout state for all clients" now also
   clears the shared `session.*.label` keys. The per-client variant is
   unchanged.
