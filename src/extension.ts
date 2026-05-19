@@ -1114,7 +1114,8 @@ interface BootstrapResult {
 function buildBootstrapStubOptions(
     sessionName: string,
     sockPath: string,
-    cwd?: string,
+    cwd: string | undefined,
+    shellIntegrationNonce: string | undefined,
 ): vscode.TerminalOptions {
     const cfg = shellConfig();
     const shellBinary = resolveShellBinary(cfg.shell);
@@ -1147,6 +1148,19 @@ function buildBootstrapStubOptions(
         env,
         hideFromUser: true,
         isTransient: true,
+        // VS Code will inject this value into the stub's env as VSCODE_NONCE
+        // (see terminalEnvironment.ts in vscode -- envMixin['VSCODE_NONCE'] =
+        // options.shellIntegration.nonce). The stub captures process.env and
+        // forwards it to the daemon, so the daemon-side shell starts with
+        // this exact nonce in its env. The visible Pseudoterminal is also
+        // created with the same nonce as ExtensionTerminalOptions.
+        // shellIntegrationNonce, so OSC 633 ; E sequences the shell emits
+        // validate against the Pseudoterminal's parser and Terminal.
+        // shellIntegration.commandLine.isTrusted reports true. Undefined on
+        // reattach (the daemon-side shell already has VSCODE_NONCE from the
+        // original session's bootstrap; we don't want a fresh stub
+        // overwriting it with a value we'd then have to discard).
+        shellIntegrationNonce,
     };
 }
 
@@ -1165,6 +1179,7 @@ function buildPseudoOptions(
     initialDims: { cols: number; rows: number },
     bootstrap: Promise<BootstrapResult>,
     isReattach: boolean,
+    shellIntegrationNonce: string | undefined,
 ): vscode.ExtensionTerminalOptions {
     const pty = new DtermPseudoterminal(sessionName, label, initialDims, bootstrap, isReattach);
     ptyBySession.set(sessionName, pty);
@@ -1188,6 +1203,18 @@ function buildPseudoOptions(
         color: new vscode.ThemeColor('terminal.ansiCyan'),
         location: viewColumn !== undefined ? { viewColumn } : undefined,
         isTransient: true,
+        // Match the nonce baked into the daemon-side shell's VSCODE_NONCE so
+        // OSC 633 ; E ; <cmd> ; <nonce> sequences emitted by shell-integration
+        // scripts validate against this Pseudoterminal's parser and surface
+        // as Terminal.shellIntegration.commandLine.isTrusted=true. For new
+        // sessions we mint the nonce in the caller and pass the same value
+        // to both this Pseudoterminal and the bootstrap stub's
+        // TerminalOptions.shellIntegrationNonce (VS Code propagates that to
+        // VSCODE_NONCE in the stub's env, which the stub captures and
+        // forwards to the daemon, so both endpoints agree). For reattach
+        // the caller fetches the existing VSCODE_NONCE from the daemon's
+        // stored env via get_session_env.
+        shellIntegrationNonce,
     };
 }
 
@@ -1267,9 +1294,15 @@ function setupBootstrapSocket(sessionName: string): {
 // The Pseudoterminal owns the stub from that point and disposes it on close.
 // Keeping the stub alive preserves the bind on VS Code's per-terminal IPC
 // socket (VSCODE_IPC_HOOK_CLI) for the lifetime of the dterm session.
-async function bootstrapShell(sessionName: string, cwd?: string): Promise<BootstrapResult> {
+async function bootstrapShell(
+    sessionName: string,
+    cwd: string | undefined,
+    shellIntegrationNonce: string | undefined,
+): Promise<BootstrapResult> {
     const { sockPath, cleanup, payload } = setupBootstrapSocket(sessionName);
-    const stub = vscode.window.createTerminal(buildBootstrapStubOptions(sessionName, sockPath, cwd));
+    const stub = vscode.window.createTerminal(
+        buildBootstrapStubOptions(sessionName, sockPath, cwd, shellIntegrationNonce),
+    );
     let resolved = false;
     let rejected = false;
     return new Promise<BootstrapResult>((resolve, reject) => {
@@ -1483,12 +1516,31 @@ async function reconnectAll(
         // having the stub alive is the precondition for any such future
         // freshness mechanism.
         const cwd = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
-        const bootstrap = bootstrapShell(name, cwd).catch(e => {
+        // Fetch the daemon-side shell's VSCODE_NONCE so the reattached
+        // Pseudoterminal's parser validates the OSC 633 ; E sequences the
+        // shell-integration script emits (Terminal.shellIntegration.
+        // commandLine.isTrusted goes from false to true). The daemon-side
+        // shell already has this value baked into its env from the
+        // original session's bootstrap; we can't change it for an existing
+        // session, only consume it. Add ~one local-Unix-socket RTT to the
+        // per-session reattach time, which is dwarfed by the bootstrap-stub
+        // spawn cost we already pay below. Undefined nonce on fetch
+        // failure (timeout / session gone / pre-tier1 daemon) falls back
+        // to letting VS Code auto-generate one; trust validation stays
+        // broken for that session but everything else keeps working.
+        const sessionEnv = await fetchSessionEnv(name);
+        const shellIntegrationNonce = sessionEnv?.VSCODE_NONCE;
+        // The reattach bootstrap stub does NOT get the nonce passed in --
+        // its captured VSCODE_NONCE is irrelevant because we already know
+        // the daemon-side shell's actual nonce from get_session_env above.
+        // Letting VS Code mint a throw-away one for the stub keeps the
+        // reattach stub's TerminalOptions minimal.
+        const bootstrap = bootstrapShell(name, cwd, undefined).catch(e => {
             log(`reconnectAll: bootstrap (reattach) failed for ${name}: ${(e as Error).message}`);
             throw e;
         });
         const t = vscode.window.createTerminal(
-            buildPseudoOptions(name, meta?.label, meta?.viewColumn, { cols: 80, rows: 24 }, bootstrap, /*isReattach=*/true),
+            buildPseudoOptions(name, meta?.label, meta?.viewColumn, { cols: 80, rows: 24 }, bootstrap, /*isReattach=*/true, shellIntegrationNonce),
         );
         terminalToSession.set(t, name);
         const pty = ptyBySession.get(name);
@@ -1642,7 +1694,9 @@ async function checkEnvFreshness(): Promise<void> {
     try {
         freshResult = await vscode.window.withProgress(
             { location: vscode.ProgressLocation.Notification, title: 'dterm: capturing fresh env...', cancellable: false },
-            () => bootstrapShell(`envfresh-${process.pid}-${Date.now()}`),
+            // Diagnostic-only stub; no visible Pseudoterminal, so we don't
+            // need to coordinate nonces -- let VS Code mint a throw-away.
+            () => bootstrapShell(`envfresh-${process.pid}-${Date.now()}`, undefined, undefined),
         );
     } catch (e) {
         vscode.window.showErrorMessage(`dterm: bootstrap capture failed: ${(e as Error).message}`);
@@ -1895,16 +1949,25 @@ export function activate(ctx: vscode.ExtensionContext): void {
                 if (!allocated) log(`profile: allocating fallback session ${sessionName}`);
                 else log(`profile: allocated session ${sessionName}`);
                 pendingFocus.add(sessionName);
+                // Mint a single shell-integration nonce for the session and
+                // pass it to both the bootstrap stub (VS Code will inject it
+                // as VSCODE_NONCE in the stub's env, which the stub captures
+                // and forwards to the daemon-side shell) and the visible
+                // Pseudoterminal (so its parser validates OSC 633 sequences
+                // emitted by the daemon-side shell). Reattach uses a
+                // different code path that reads VSCODE_NONCE back from the
+                // daemon's stored env.
+                const shellIntegrationNonce = crypto.randomUUID();
                 // Bootstrap runs in parallel with VS Code rendering the visible
                 // terminal. Returns immediately so the user sees the terminal
                 // within tens of ms; the Pseudoterminal queues input until the
                 // bootstrap+daemon attach completes.
-                const bootstrapPromise = bootstrapShell(sessionName, cwd).catch(e => {
+                const bootstrapPromise = bootstrapShell(sessionName, cwd, shellIntegrationNonce).catch(e => {
                     log(`profile: bootstrap failed for ${sessionName}: ${(e as Error).message}`);
                     throw e;
                 });
                 return new vscode.TerminalProfile(
-                    buildPseudoOptions(sessionName, undefined, undefined, { cols: 80, rows: 24 }, bootstrapPromise, /*isReattach=*/false),
+                    buildPseudoOptions(sessionName, undefined, undefined, { cols: 80, rows: 24 }, bootstrapPromise, /*isReattach=*/false, shellIntegrationNonce),
                 );
             },
         }),
