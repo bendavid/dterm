@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.8.1
+
+CI maintenance only -- no extension behaviour change.
+
+- Bump the workflow's GitHub-action wrappers to Node-24 majors
+  (`checkout@v6`, `setup-node@v6`, `upload-artifact@v7`,
+  `download-artifact@v8`) to clear the Node-20 deprecation warning
+  ahead of GitHub's 2026-06-02 forced switchover. The runtime Node
+  used to compile/rebuild node-pty stays on 20 to match the VS Code
+  Electron runtime.
+
 ## 0.8.0
 
 User-set session labels are now workspace-shared across clients.
