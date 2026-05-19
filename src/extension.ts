@@ -1501,6 +1501,50 @@ async function reconnectAll(
     setTimeout(() => logTabGroupsState('post-reconnect'), 500);
 }
 
+// Delete all workspaceState keys starting with the given prefix. Used by the
+// dterm.clearLayout commands to wipe layout state either for the current
+// client only (prefix `client.${clientId}.`) or for every client that has
+// touched this workspace (prefix `client.`). Note: clearing layout state
+// doesn't dispose existing dterm terminals or kill daemon sessions; the
+// effect is visible on the next reload, when reconnectAll rebuilds layout
+// from scratch without the previously-saved meta.
+async function clearLayoutState(prefix: string, scopeLabel: string): Promise<void> {
+    if (!activeCtx) return;
+    // Enumerate matching keys + collect summary stats for the confirm dialog.
+    const matching: string[] = [];
+    const clientIds = new Set<string>();
+    const sessions = new Set<string>();
+    for (const key of activeCtx.workspaceState.keys()) {
+        if (!key.startsWith(prefix)) continue;
+        matching.push(key);
+        const m = key.match(/^client\.([^.]+)\.(.+)$/);
+        if (m) {
+            clientIds.add(m[1]);
+            const sessionMatch = m[2].match(/^session\.(.+)$/);
+            if (sessionMatch) sessions.add(sessionMatch[1]);
+        }
+    }
+    if (matching.length === 0) {
+        vscode.window.showInformationMessage(`dterm: no persisted layout state for ${scopeLabel} in this workspace.`);
+        return;
+    }
+    const detail = `${matching.length} entries (${clientIds.size} client${clientIds.size === 1 ? '' : 's'}, ${sessions.size} session label${sessions.size === 1 ? '' : 's'})`;
+    const choice = await vscode.window.showWarningMessage(
+        `dterm: clear persisted layout state for ${scopeLabel} in this workspace?`,
+        {
+            modal: true,
+            detail: `${detail}. Existing terminals continue to work; the effect of clearing shows up on the next window reload, when reconnectAll rebuilds layout without the saved meta. Daemon sessions are not affected -- use "dterm: Restart daemon" if you also want to terminate live sessions.`,
+        },
+        'Clear',
+    );
+    if (choice !== 'Clear') return;
+    for (const key of matching) {
+        await activeCtx.workspaceState.update(key, undefined);
+    }
+    log(`clearLayoutState: cleared ${matching.length} entries for ${scopeLabel} (prefix=${JSON.stringify(prefix)})`);
+    vscode.window.showInformationMessage(`dterm: cleared ${detail} for ${scopeLabel}. Reload window to see effect.`);
+}
+
 // Diagnostic: compare the env of the active dterm's daemon-side shell to
 // what VS Code would inject for a freshly-spawned terminal right now, and
 // show the diff. Useful for spotting drift in rotating endpoints
@@ -1975,6 +2019,13 @@ export function activate(ctx: vscode.ExtensionContext): void {
 
     ctx.subscriptions.push(
         vscode.commands.registerCommand('dterm.checkEnvFreshness', () => checkEnvFreshness()),
+    );
+
+    ctx.subscriptions.push(
+        vscode.commands.registerCommand('dterm.clearLayoutForCurrentClient',
+            () => clearLayoutState(`client.${clientId}.`, 'current client')),
+        vscode.commands.registerCommand('dterm.clearLayoutForAllClients',
+            () => clearLayoutState('client.', 'all clients')),
     );
 
     ctx.subscriptions.push(

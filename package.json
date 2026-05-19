@@ -68,6 +68,14 @@
       {
         "command": "dterm.pushDaemonSettings",
         "title": "dterm: Push current settings to daemon"
+      },
+      {
+        "command": "dterm.clearLayoutForCurrentClient",
+        "title": "dterm: Clear persisted layout state for this client"
+      },
+      {
+        "command": "dterm.clearLayoutForAllClients",
+        "title": "dterm: Clear persisted layout state for all clients"
       }
     ],
     "configuration": {
