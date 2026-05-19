@@ -853,6 +853,18 @@ class DtermPseudoterminal implements vscode.Pseudoterminal {
             // EVC, and it never lands in the extension host's process.env)
             // can also be symlink-indirected.
             Object.assign(env, refreshManagedSockets(this.bootstrapResult.env));
+            // Override TERM_PROGRAM so consumers that key off it (notably
+            // Claude Code's CLI) don't assume they're inside a freshly-spawned
+            // VS Code terminal whose CLAUDE_CODE_SSE_PORT env var is fresh.
+            // Claude Code's auto-connect logic falls back to lock-file based
+            // discovery (~/.claude/ide/<port>.lock) when TERM_PROGRAM is
+            // anything other than "vscode", which gives us cross-reload
+            // freshness for free -- the lock files are written by Claude
+            // Code's extension on each activation and the CLI reads them
+            // at invocation time.
+            env.TERM_PROGRAM = 'dterm';
+            const dtermVersion = activeCtx?.extension.packageJSON?.version as string | undefined;
+            if (dtermVersion) env.TERM_PROGRAM_VERSION = dtermVersion;
             msg = {
                 type: 'open',
                 name: this.sessionName,
