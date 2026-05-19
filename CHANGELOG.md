@@ -1,5 +1,71 @@
 # Changelog
 
+## 0.7.0
+
+`code` and `claude` CLIs now work in dterm shells across VS Code
+window reloads. Substantial improvements to tab/session mapping,
+managed-socket plumbing, and a new diagnostic command.
+
+- The bootstrap stub stays alive for the lifetime of the dterm
+  session instead of exiting after capturing env. This keeps VS
+  Code's per-terminal IPC socket (`VSCODE_IPC_HOOK_CLI`) bound, so
+  the `code` CLI can connect to its parent VS Code window from
+  within a dterm shell. Each dterm session now has one extra hidden
+  `pty-host` child process (small memory cost; see below).
+- `VSCODE_IPC_HOOK_CLI` is now in the managed-sockets list. The
+  daemon-side shell's env uses a stable workspace-scoped symlink
+  path; on every bootstrap (new session AND reattach) the symlink
+  target is updated to the current keep-alive stub's IPC socket. As
+  long as a stub is alive for the session, `code` CLI continues to
+  work across window reloads, SSH reconnects, and VS Code Server
+  restarts.
+- Reattach now also spawns a fresh bootstrap stub purely to hold a
+  fresh IPC socket bound for the reattached session. The captured
+  env's `VSCODE_GIT_IPC_HANDLE`, `SSH_AUTH_SOCK`, and
+  `VSCODE_IPC_HOOK_CLI` are all symlink-refreshed so existing daemon-
+  side shells transparently resolve to the current sockets.
+- `TERM_PROGRAM` is set to `dterm` in the daemon-side shell's env
+  (overriding VS Code's default `vscode`). This routes the `claude`
+  CLI into its lock-file-based IDE discovery path (reading
+  `~/.claude/ide/<port>.lock`) rather than relying on the inherited
+  `CLAUDE_CODE_SSE_PORT` env var which goes stale on every reload.
+  `claude` now works in dterm shells across reload without further
+  plumbing.
+- Tab-to-session mapping is now driven by an invisible session ID
+  encoded directly in the terminal name (Unicode tag characters
+  appended after a `U+200B` marker). `getSessionFromTab` decodes the
+  embedded id at first observation and caches in a `WeakMap<Tab,
+  sessionName>`. Fixes the long-standing class of layout bugs where
+  multiple terminals sharing the same process name (e.g. several
+  unrenamed terminals all showing `bash`) caused
+  editor/panel-misclassification on reattach.
+- User inline-renamed tabs also carry the session encoding: when a
+  rename is detected, dterm re-fires `onDidChangeName` with the
+  user's visible value plus the marker+encoded id appended (the
+  visible portion is preserved verbatim). Cross-reload mapping
+  stays reliable even when users rename multiple tabs to similar
+  names.
+- Editor/panel misclassification fix: the `creationOptions.location`
+  cross-check used to stick permanently, so a user dragging a
+  reconnect-spawned editor terminal back to the panel had the move
+  silently ignored. Now gated on `everSeenInEditor` so the cross-
+  check only applies before the first successful tabGroups match,
+  and drags propagate correctly.
+- Managed-socket symlinks now actually reach the daemon-side shell.
+  Previously the `Object.assign(env, refreshManagedSockets())` in
+  `buildBootstrapStubOptions` was a no-op because VS Code applies
+  `EnvironmentVariableCollection` mutators after `TerminalOptions.env`
+  -- the Remote-SSH and git extensions' Replace mutators silently
+  overwrote our symlink paths with raw upstream values. The override
+  now runs in `DtermPseudoterminal.connect()` after bootstrap
+  capture, before sending env to the daemon, where nothing can clobber
+  it. `SSH_AUTH_SOCK` and `VSCODE_GIT_IPC_HANDLE` symlink indirection
+  now genuinely works as the README always claimed.
+- New `dterm: Check env freshness` command. Reads the daemon-side
+  shell's current env from `/proc/<pid>/environ` and diffs it against
+  a freshly-captured bootstrap env. Useful for spotting drift in
+  rotating endpoints after a reconnect.
+
 ## 0.6.0
 
 Architecture overhaul: Pseudoterminal-backed visible terminals, direct
