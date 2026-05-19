@@ -26,9 +26,9 @@ jobs:
             node_arch: arm64
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
 
-      - uses: actions/setup-node@v5
+      - uses: actions/setup-node@v6
         with:
           node-version: '20'
           cache: 'npm'
@@ -88,7 +88,7 @@ jobs:
       - name: Package extension
         run: npx --yes @vscode/vsce@latest package --target ${{ matrix.target }} --out dterm-${{ matrix.target }}.vsix
 
-      - uses: actions/upload-artifact@v5
+      - uses: actions/upload-artifact@v7
         with:
           name: dterm-${{ matrix.target }}
           path: dterm-${{ matrix.target }}.vsix
@@ -108,9 +108,9 @@ jobs:
             clang_arch: x86_64
     runs-on: macos-14
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
 
-      - uses: actions/setup-node@v5
+      - uses: actions/setup-node@v6
         with:
           node-version: '20'
           cache: 'npm'
@@ -157,7 +157,7 @@ jobs:
       - name: Package extension
         run: npx --yes @vscode/vsce@latest package --target ${{ matrix.target }} --out dterm-${{ matrix.target }}.vsix
 
-      - uses: actions/upload-artifact@v5
+      - uses: actions/upload-artifact@v7
         with:
           name: dterm-${{ matrix.target }}
           path: dterm-${{ matrix.target }}.vsix
@@ -171,7 +171,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v5
+      - uses: actions/download-artifact@v8
         with:
           path: artifacts
           merge-multiple: true
