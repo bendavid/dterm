@@ -597,6 +597,14 @@ function resolveShellBinary(configured: string | undefined): string {
 interface ManagedSocket {
     envVar: string;
     linkName: string;
+    // When true, always source the upstream value from the extension host's
+    // process.env, ignoring any captured-from-bootstrap value. Used for
+    // VSCODE_IPC_HOOK_CLI so we point daemon-side shells at the extension-
+    // host CLIServer (one per window, lifetime = extension host) instead of
+    // the per-terminal CLIServer that VS Code provisions for the bootstrap
+    // stub (one per dterm session, would require us to hold the stub's pty
+    // open for the whole session to keep it bound).
+    preferProcessEnv?: boolean;
 }
 
 // VS Code-managed Unix sockets that go stale across server restarts / client
@@ -609,19 +617,23 @@ interface ManagedSocket {
 // VSCODE_GIT_IPC_HANDLE is the askpass/credential IPC the git extension
 // exports into terminals.
 //
-// VSCODE_IPC_HOOK_CLI is the per-VS-Code-terminal socket that the `code` CLI
-// connects to. Rotates per terminal spawn (each terminal gets its own
-// socket, alive only while that terminal's pty-host process is alive). Our
-// bootstrap stub's launcher script exec's into sleep after the node-based
-// env capture exits, so the kernel-level PID survives and VS Code keeps the
-// per-terminal CLIServer bound for the lifetime of each dterm session.
-// Updating this symlink on each bootstrap (new + reattach) points daemon-
-// side shells at the current stub's socket, which keeps `code` CLI working
-// across VS Code window reload.
+// VSCODE_IPC_HOOK_CLI is the unix-socket HTTP server the `code` CLI connects
+// to. VS Code actually exposes two CLIServers per window: a per-terminal one
+// minted in remoteTerminalChannel.ts (one per spawned shell) and an
+// extension-host-wide one minted in extHostExtensionService.ts (set on the
+// extension host's own process.env, one per window). We point at the
+// extension-host one because (a) it survives independent of any individual
+// terminal pty so the stub can exit immediately after env capture, and
+// (b) the per-terminal scope turned out not to be load-bearing in VS Code's
+// receiving handler (the looked-up pty is used only as a liveness gate; the
+// actual `code <file>` dispatch goes through the window's commandService
+// with no pty-derived context). Updating this symlink on each reload points
+// daemon-side shells at the current extension host's CLIServer, which keeps
+// `code` CLI working across VS Code window reload.
 const MANAGED_SOCKETS: ManagedSocket[] = [
     { envVar: 'SSH_AUTH_SOCK',         linkName: 'ssh-auth.sock' },
     { envVar: 'VSCODE_GIT_IPC_HANDLE', linkName: 'vscode-git-ipc.sock' },
-    { envVar: 'VSCODE_IPC_HOOK_CLI',   linkName: 'vscode-ipc.sock' },
+    { envVar: 'VSCODE_IPC_HOOK_CLI',   linkName: 'vscode-ipc.sock', preferProcessEnv: true },
 ];
 
 function updateSymlinkAtomic(target: string, linkPath: string): boolean {
@@ -662,7 +674,9 @@ function refreshManagedSockets(envSource?: Record<string, string>): Record<strin
     const dir = agentDir(tag);
     let dirEnsured = false;
     for (const m of MANAGED_SOCKETS) {
-        const upstream = envSource?.[m.envVar] ?? process.env[m.envVar];
+        const upstream = m.preferProcessEnv
+            ? process.env[m.envVar]
+            : envSource?.[m.envVar] ?? process.env[m.envVar];
         if (!upstream) continue;
         if (!dirEnsured) {
             try {
@@ -756,9 +770,10 @@ class DtermPseudoterminal implements vscode.Pseudoterminal {
     private openResolve?: () => void;
     readonly openPromise: Promise<void> = new Promise(r => { this.openResolve = r; });
 
-    // Held so close() can dispose the kept-alive stub Terminal whenever the
-    // bootstrap promise resolves -- including the case where close() is
-    // called before the bootstrap finishes (rapid create-then-close).
+    // Held so connect() can await the bootstrap-captured env+argv before
+    // sending the daemon `open` message (new sessions) and so reattach can
+    // hook the bootstrap.then() handler to refresh managed-socket symlinks
+    // even though we don't gate connect on it.
     private readonly bootstrapPromise: Promise<BootstrapResult>;
 
     constructor(
@@ -776,8 +791,10 @@ class DtermPseudoterminal implements vscode.Pseudoterminal {
         this.bootstrapPromise = bootstrap;
         if (isReattach) {
             // Daemon-side shell already exists; don't gate connect on the
-            // bootstrap. We still hold the promise so close() can dispose
-            // the kept-alive stub Terminal once it spawns.
+            // bootstrap. The bootstrap still runs to refresh the workspace-
+            // scoped managed-socket symlinks (SSH_AUTH_SOCK,
+            // VSCODE_GIT_IPC_HANDLE) against post-reload upstream paths --
+            // see the bootstrap.then() handler below.
             this.bootstrapDone = true;
         }
         bootstrap.then(
@@ -799,9 +816,9 @@ class DtermPseudoterminal implements vscode.Pseudoterminal {
                     this.bootstrapDone = true;
                     this.tryConnect();
                 }
-                // For reattach, bootstrapResult is recorded so close() can
-                // dispose result.stub; we don't use the captured env or args
-                // beyond the managed-socket refresh above.
+                // For reattach we don't use the captured env or args beyond
+                // the managed-socket refresh above; recorded as
+                // bootstrapResult only so future diagnostics can inspect.
             },
             (e: Error) => {
                 if (!isReattach) {
@@ -912,7 +929,6 @@ class DtermPseudoterminal implements vscode.Pseudoterminal {
             delete env.DTERM_BOOTSTRAP_SOCKET;
             delete env.DTERM_SESSION;
             delete env.DTERM_REAL_SHELL;
-            delete env.DTERM_STUB_PATH;
             // Apply our workspace-scoped symlink indirection for managed
             // sockets (SSH_AUTH_SOCK, VSCODE_GIT_IPC_HANDLE). We can't rely
             // on TerminalOptions.env to deliver these to the spawned shell
@@ -1047,16 +1063,10 @@ class DtermPseudoterminal implements vscode.Pseudoterminal {
             try { this.sock.end(); } catch { /* ignore */ }
             this.sock = undefined;
         }
-        // Dispose the kept-alive bootstrap stub. Resolving via the stored
-        // promise handles both cases: bootstrap already completed (dispose
-        // immediately) and bootstrap still in flight (dispose when it
-        // resolves, so a fast close-during-bootstrap doesn't leak).
-        void this.bootstrapPromise.then(
-            result => {
-                try { result.stub.dispose(); } catch { /* already gone */ }
-            },
-            () => { /* bootstrap failed; no stub to dispose */ },
-        );
+        // No stub to dispose here -- bootstrapShell disposes the hidden
+        // Terminal as soon as the env-capture payload is received, since
+        // the stub process has exited by then and we don't depend on its
+        // per-terminal CLIServer staying bound.
     }
 }
 
@@ -1090,27 +1100,27 @@ function stubPathForShell(shellBinary: string): { stubPath: string; shimName: st
 // the stub with. The visible Pseudoterminal hands this to the daemon in its
 // `open` message so the daemon-side shell spawns with the right env.
 //
-// Also carries the stub Terminal itself. The node-based env-capture process
-// exits as soon as it has written the payload; the launcher script
-// (out/stub-launcher.sh) then exec's `sleep <large>` over its own image so
-// the kernel-level PID survives and VS Code's pty-host keeps the per-terminal
-// CLIServer for VSCODE_IPC_HOOK_CLI bound. The Pseudoterminal calls
-// stub.dispose() in its close() handler, which SIGHUPs the sleep and lets
-// VS Code clean up the pty + CLIServer.
+// The stub process exits as soon as the payload write completes -- VS Code's
+// pty-host sees onProcessExit, disposes the per-terminal CLIServer it
+// provisioned for us, and unlinks that socket file. We don't care because
+// the daemon-side shell's env points its VSCODE_IPC_HOOK_CLI at the
+// extension-host CLIServer (one per window, see MANAGED_SOCKETS), not the
+// per-terminal one. No stub keep-alive, no Terminal kept around past
+// payload arrival.
 interface BootstrapResult {
     env: Record<string, string>;
     args: string[];
-    stub: vscode.Terminal;
 }
 
 // Options for the hidden bootstrap stub: a real shell terminal whose only
 // purpose is to be spawned through VS Code's normal terminal pipeline so it
-// inherits shell-integration env injection. VS Code launches a launcher
-// shell script (out/shims/<basename> -> ../stub-launcher.sh) which invokes
-// the node-based capture (out/stub.js) to write the captured env + argv to
-// the per-session Unix socket at DTERM_BOOTSTRAP_SOCKET, then exec's into
-// sleep so the kernel-level PID keeps the pty bound for the session's
-// lifetime. No daemon involvement.
+// inherits shell-integration env injection. VS Code launches stub.js (via
+// the out/shims/<basename> symlink so its basename keys shell-integration
+// recognition to the right shell), which writes the captured env + argv to
+// the per-session Unix socket at DTERM_BOOTSTRAP_SOCKET and exits. No daemon
+// involvement, no keep-alive -- `code` CLI in the daemon-side shell reaches
+// VS Code via the extension-host CLIServer (managed via the symlink in
+// MANAGED_SOCKETS), not via the stub's per-terminal CLIServer.
 function buildBootstrapStubOptions(
     sessionName: string,
     sockPath: string,
@@ -1122,19 +1132,17 @@ function buildBootstrapStubOptions(
     const { stubPath, shimName } = stubPathForShell(shellBinary);
     // The stub only needs enough env to know where to write its captured
     // payload (DTERM_BOOTSTRAP_SOCKET), to behave as Node when launched via
-    // Electron (ELECTRON_RUN_AS_NODE), to find stub.js from the launcher
-    // script (DTERM_STUB_PATH), and to know which real shell binary the
-    // daemon should spawn (DTERM_REAL_SHELL, when the shim basename doesn't
-    // match the configured shell). The managed-socket symlink indirection
-    // (SSH_AUTH_SOCK, VSCODE_GIT_IPC_HANDLE) is applied later, in the
-    // Pseudoterminal's connect() before the env is sent to the daemon,
-    // because TerminalOptions.env doesn't reliably override values
-    // contributed by other extensions' EnvironmentVariableCollections.
+    // Electron (ELECTRON_RUN_AS_NODE), and to know which real shell binary
+    // the daemon should spawn (DTERM_REAL_SHELL, when the shim basename
+    // doesn't match the configured shell). The managed-socket symlink
+    // indirection (SSH_AUTH_SOCK, VSCODE_GIT_IPC_HANDLE, VSCODE_IPC_HOOK_CLI)
+    // is applied later, in the Pseudoterminal's connect() before the env is
+    // sent to the daemon, because TerminalOptions.env doesn't reliably
+    // override values contributed by other extensions'
+    // EnvironmentVariableCollections.
     const env: { [key: string]: string } = {
         DTERM_SESSION: sessionName,
         DTERM_BOOTSTRAP_SOCKET: sockPath,
-        // stubPath is <ext>/out/shims/<basename>; stub.js lives one level up.
-        DTERM_STUB_PATH: path.join(path.dirname(stubPath), '..', 'stub.js'),
         ELECTRON_RUN_AS_NODE: '1',
     };
     if (shimName === 'dterm' || path.basename(shellBinary) !== shimName) {
@@ -1168,9 +1176,9 @@ function buildBootstrapStubOptions(
 // interacts with. Connects directly to the daemon via a Unix socket and
 // forwards stdio. `bootstrap` is always provided: for new sessions, its
 // captured env+argv get included in the daemon's `open` message; for
-// reattach, only its kept-alive stub Terminal is used (to keep the
-// per-session VS Code IPC socket bound) -- the captured env/argv go
-// unused because the daemon-side shell already exists. `isReattach`
+// reattach, the captured env is only used to refresh the workspace-scoped
+// managed-socket symlinks against post-reload upstream values -- the
+// daemon-side shell already exists with its env baked in. `isReattach`
 // tells the Pseudoterminal which of the two it is.
 function buildPseudoOptions(
     sessionName: string,
@@ -1289,11 +1297,13 @@ function setupBootstrapSocket(sessionName: string): {
 
 // Spawn the hidden bootstrap stub through VS Code's terminal pipeline so it
 // inherits shell-integration env, wait for it to write the captured env+argv
-// to the per-session bootstrap socket, and return the result -- including
-// the stub Terminal itself, which stays alive after the payload is captured.
-// The Pseudoterminal owns the stub from that point and disposes it on close.
-// Keeping the stub alive preserves the bind on VS Code's per-terminal IPC
-// socket (VSCODE_IPC_HOOK_CLI) for the lifetime of the dterm session.
+// to the per-session bootstrap socket, and return the captured payload. The
+// stub process exits immediately after writing the payload; we dispose() the
+// Terminal as a safety net but the pty is already gone by then. The daemon-
+// side shell's `code` CLI reaches VS Code via the extension-host CLIServer
+// (managed via the workspace-scoped symlink in MANAGED_SOCKETS), not via the
+// stub's per-terminal CLIServer, so the stub's lifetime is irrelevant to
+// post-bootstrap `code` invocations.
 async function bootstrapShell(
     sessionName: string,
     cwd: string | undefined,
@@ -1316,13 +1326,11 @@ async function bootstrapShell(
         }, 10_000);
         const disposable = vscode.window.onDidCloseTerminal(t => {
             if (t !== stub) return;
-            // Stub exit before payload means the socket write failed (or
-            // the stub crashed). The payload promise will reject (or has
-            // already), so we let it -- the reject() below handles cleanup.
-            // After payload is received, we transfer ownership of the stub
-            // Terminal to the Pseudoterminal; if it dies unexpectedly later
-            // the session's `code` CLI just degrades to non-functional, but
-            // the rest of the dterm session keeps working.
+            // Stub exit is the expected outcome once the payload has been
+            // written -- the process writes, end()s the socket, and the
+            // event loop drains. If the exit fires *before* the payload
+            // arrives, it means the socket write failed (or the stub
+            // crashed): treat as a bootstrap failure.
             const code = t.exitStatus?.code ?? 0;
             if (code !== 0 && !resolved && !rejected) {
                 rejected = true;
@@ -1338,9 +1346,10 @@ async function bootstrapShell(
                 resolved = true;
                 clearTimeout(timeout);
                 disposable.dispose();
-                // Do NOT dispose the stub -- caller takes ownership and
-                // disposes it when the Pseudoterminal closes.
-                resolve({ ...result, stub });
+                // Dispose the (likely already-exited) hidden Terminal so VS
+                // Code doesn't keep a zombie tab entry around.
+                try { stub.dispose(); } catch { /* already gone */ }
+                resolve(result);
             },
             err => {
                 if (resolved || rejected) return;
@@ -1508,13 +1517,14 @@ async function reconnectAll(
         const meta = getMeta(name);
         log(`reconnectAll: creating terminal for ${name} (${meta?.viewColumn !== undefined ? `col ${meta.viewColumn} idx ${meta.tabIndex ?? 0}` : `panel idx ${meta?.panelIndex ?? '?'}`})`);
         // Reattach: the daemon-side shell already exists, so we don't need
-        // env/argv from the bootstrap. We still spawn one (and keep it
-        // alive for the duration of the Pseudoterminal) purely to hold a
-        // bound VS Code per-session IPC socket via VSCODE_IPC_HOOK_CLI --
-        // the daemon-side shell's env isn't refreshed to point at it (a
-        // future symlink-managed handoff would be needed for that), but
-        // having the stub alive is the precondition for any such future
-        // freshness mechanism.
+        // env/argv from the bootstrap. We still spawn one because its env
+        // capture is the only way to harvest the per-terminal-spawn
+        // EnvironmentVariableCollection contributions (the git extension's
+        // current VSCODE_GIT_IPC_HANDLE, Remote-SSH's current SSH_AUTH_SOCK)
+        // for refreshManagedSockets to retarget the workspace-scoped
+        // symlinks. The stub exits immediately after writing the payload;
+        // VSCODE_IPC_HOOK_CLI is retargeted from process.env (the extension-
+        // host CLIServer's current path), not from the stub's captured value.
         const cwd = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
         // Fetch the daemon-side shell's VSCODE_NONCE so the reattached
         // Pseudoterminal's parser validates the OSC 633 ; E sequences the

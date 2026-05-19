@@ -1,5 +1,51 @@
 # Changelog
 
+## 0.9.0
+
+Route `code` CLI through the extension-host CLIServer instead of
+the per-terminal one. Eliminates the bootstrap-stub keep-alive
+entirely.
+
+VS Code provisions two `VSCODE_IPC_HOOK_CLI` sockets: a per-terminal
+one minted in `remoteTerminalChannel.ts` (lifetime = pty), and an
+extension-host-wide one minted in `extHostExtensionService.ts`
+(lifetime = extension host, set on the extension host's own
+`process.env`). dterm previously pointed daemon-side shells at the
+per-terminal one, which required holding the bootstrap stub's pty
+open for the whole session (the per-terminal CLIServer disposes on
+`onProcessExit`). We now point at the extension-host one, which is
+already kept alive by VS Code for as long as the window is open and
+doesn't require any keep-alive trick on our end.
+
+The receiving handler in VS Code (`remoteTerminalBackend.ts`) uses
+the per-terminal `persistentProcessId` only as a liveness gate; the
+actual `code <file>` dispatch goes through the window's
+`commandService` with no pty-derived context. So losing the per-
+terminal scope costs nothing observable; window-routing still works
+correctly because each VS Code window has its own extension host
+with its own CLIServer.
+
+- `MANAGED_SOCKETS` flags `VSCODE_IPC_HOOK_CLI` with `preferProcessEnv:
+  true`. `refreshManagedSockets` now reads its upstream from
+  `process.env` (the extension host's CLIServer path) instead of from
+  the bootstrap-captured value.
+- The bootstrap stub no longer needs to be kept alive. `out/stub.js`
+  exits immediately after writing its capture payload, and
+  `bootstrapShell` disposes the (already-exited) hidden Terminal as
+  soon as the payload arrives. No more `setInterval` heartbeat
+  (gone in 0.8.2), no more `exec sleep` trick from the launcher
+  (now also gone).
+- `out/stub-launcher.sh` is removed. `out/shims/{bash,zsh,fish,dterm}`
+  symlink directly to `stub.js` again, the way they did before 0.8.2.
+  `postcompile.js` defensively `unlink`s any stale launcher file from
+  prior builds.
+- `DtermPseudoterminal.close()` no longer disposes any kept-alive
+  stub Terminal -- there isn't one. The `BootstrapResult.stub` field
+  is gone.
+- Per-session keep-alive RSS drops from ~1-2 MB (sleep) to ~0 -- the
+  hidden Terminal is fully gone after env capture, with no resident
+  process at all.
+
 ## 0.8.3
 
 Fix shell-integration command-line trust validation in dterm terminals.
