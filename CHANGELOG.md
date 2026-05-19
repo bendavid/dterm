@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.8.0
+
+User-set session labels are now workspace-shared across clients.
+Renaming a terminal on one laptop carries over to other laptops
+connecting to the same remote workspace.
+
+- Labels are stored in a workspace-shared keyspace
+  (`session.<name>.label`), not under the per-client `client.<uuid>.`
+  prefix. Positions (viewColumn / tabIndex / panelIndex) remain per-
+  client so each laptop keeps its own monitor/screen-real-estate
+  arrangement.
+- Last-write-wins on concurrent edits. Cross-client visibility shows
+  up at the other client's next window reload; there is no live
+  cross-extension-host change notification.
+- "dterm: Clear persisted layout state for all clients" now also
+  clears the shared `session.*.label` keys. The per-client variant is
+  unchanged.
+- No backwards-compatibility migration: labels persisted under the old
+  per-client layout (0.7.x and earlier) are no longer read. Reapply
+  any inline renames you want to keep.
+
 ## 0.7.1
 
 - New command "dterm: Clear persisted layout state for this client"

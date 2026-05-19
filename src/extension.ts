@@ -112,6 +112,20 @@ function metaKey(sessionName: string): string {
     return `client.${clientId}.session.${sessionName}`;
 }
 
+// User-set labels are stored in a workspace-shared keyspace (no client
+// prefix) so renaming a terminal on one laptop carries over to the other
+// laptops connecting to the same remote workspace. Positions stay per-client
+// (different monitors / screen real estate / preferences) but labels are
+// content judgements the user wants consistent. Last-write-wins; cross-
+// client visibility happens at the other client's next window reload (no
+// live change notification across extension hosts).
+function labelKey(sessionName: string): string {
+    return `session.${sessionName}.label`;
+}
+
+const LABEL_KEY_PREFIX = 'session.';
+const LABEL_KEY_SUFFIX = '.label';
+
 function activeKey(): string {
     return `client.${clientId}.active`;
 }
@@ -166,19 +180,35 @@ async function setEditorActive(viewColumn: number, sessionName: string | undefin
     await activeCtx.workspaceState.update(editorActiveKey(viewColumn), sessionName);
 }
 
+// Per-client meta fields (positions). label lives in a separate workspace-
+// shared keyspace -- see labelKey() above.
+type SessionMetaPerClient = Omit<SessionMeta, 'label'>;
+
 function getMeta(sessionName: string): SessionMeta | undefined {
     if (!activeCtx) return undefined;
-    return activeCtx.workspaceState.get<SessionMeta>(metaKey(sessionName));
+    const perClient = activeCtx.workspaceState.get<SessionMetaPerClient>(metaKey(sessionName));
+    const label = activeCtx.workspaceState.get<string>(labelKey(sessionName));
+    if (!perClient && label === undefined) return undefined;
+    return { ...perClient, label };
 }
 
 async function setMeta(sessionName: string, meta: SessionMeta | undefined): Promise<void> {
     if (!activeCtx) return;
-    const empty = !meta || (
-        meta.label === undefined
-        && meta.viewColumn === undefined
-        && meta.panelIndex === undefined
-    );
-    await activeCtx.workspaceState.update(metaKey(sessionName), empty ? undefined : meta);
+    if (meta === undefined) {
+        await Promise.all([
+            activeCtx.workspaceState.update(metaKey(sessionName), undefined),
+            activeCtx.workspaceState.update(labelKey(sessionName), undefined),
+        ]);
+        return;
+    }
+    const { label, ...perClient } = meta;
+    const perClientEmpty = perClient.viewColumn === undefined
+        && perClient.tabIndex === undefined
+        && perClient.panelIndex === undefined;
+    await Promise.all([
+        activeCtx.workspaceState.update(metaKey(sessionName), perClientEmpty ? undefined : perClient),
+        activeCtx.workspaceState.update(labelKey(sessionName), label),
+    ]);
 }
 
 function metaEqual(a: SessionMeta | undefined, b: SessionMeta | undefined): boolean {
@@ -416,10 +446,24 @@ function pruneStaleMeta(liveSessionNames: Set<string>): void {
     if (!activeCtx) return;
     const sessionPrefix = `client.${clientId}.session.`;
     for (const key of activeCtx.workspaceState.keys()) {
-        if (!key.startsWith(sessionPrefix)) continue;
-        const session = key.slice(sessionPrefix.length);
-        if (!liveSessionNames.has(session)) {
-            void activeCtx.workspaceState.update(key, undefined);
+        // Per-client session meta (positions).
+        if (key.startsWith(sessionPrefix)) {
+            const session = key.slice(sessionPrefix.length);
+            if (!liveSessionNames.has(session)) {
+                void activeCtx.workspaceState.update(key, undefined);
+            }
+            continue;
+        }
+        // Workspace-shared session label keys (`session.<name>.label`).
+        // Pruned by every client that runs reconnectAll; whichever runs first
+        // wins. Safe because the shared store has a single entry per session,
+        // not per-client.
+        if (key.startsWith(LABEL_KEY_PREFIX) && key.endsWith(LABEL_KEY_SUFFIX)) {
+            const session = key.slice(LABEL_KEY_PREFIX.length, -LABEL_KEY_SUFFIX.length);
+            if (!liveSessionNames.has(session)) {
+                void activeCtx.workspaceState.update(key, undefined);
+            }
+            continue;
         }
     }
     // Drop the saved-active and panel-active keys if they point at dead
@@ -1501,28 +1545,33 @@ async function reconnectAll(
     setTimeout(() => logTabGroupsState('post-reconnect'), 500);
 }
 
-// Delete all workspaceState keys starting with the given prefix. Used by the
-// dterm.clearLayout commands to wipe layout state either for the current
-// client only (prefix `client.${clientId}.`) or for every client that has
-// touched this workspace (prefix `client.`). Note: clearing layout state
-// doesn't dispose existing dterm terminals or kill daemon sessions; the
-// effect is visible on the next reload, when reconnectAll rebuilds layout
-// from scratch without the previously-saved meta.
-async function clearLayoutState(prefix: string, scopeLabel: string): Promise<void> {
+// Delete all workspaceState keys starting with any of the given prefixes.
+// Used by the dterm.clearLayout commands:
+//   - current client: prefixes = [`client.${clientId}.`]
+//   - all clients:    prefixes = [`client.`, `session.`]  (also wipes the
+//                                   shared session-label store)
+// Clearing layout state doesn't dispose existing dterm terminals or kill
+// daemon sessions; the effect is visible on the next reload, when
+// reconnectAll rebuilds layout from scratch without the previously-saved
+// meta.
+async function clearLayoutState(prefixes: string[], scopeLabel: string): Promise<void> {
     if (!activeCtx) return;
     // Enumerate matching keys + collect summary stats for the confirm dialog.
     const matching: string[] = [];
     const clientIds = new Set<string>();
     const sessions = new Set<string>();
     for (const key of activeCtx.workspaceState.keys()) {
-        if (!key.startsWith(prefix)) continue;
+        if (!prefixes.some(p => key.startsWith(p))) continue;
         matching.push(key);
-        const m = key.match(/^client\.([^.]+)\.(.+)$/);
-        if (m) {
-            clientIds.add(m[1]);
-            const sessionMatch = m[2].match(/^session\.(.+)$/);
+        const clientMatch = key.match(/^client\.([^.]+)\.(.+)$/);
+        if (clientMatch) {
+            clientIds.add(clientMatch[1]);
+            const sessionMatch = clientMatch[2].match(/^session\.(.+)$/);
             if (sessionMatch) sessions.add(sessionMatch[1]);
+            continue;
         }
+        const labelMatch = key.match(/^session\.(.+)\.label$/);
+        if (labelMatch) sessions.add(labelMatch[1]);
     }
     if (matching.length === 0) {
         vscode.window.showInformationMessage(`dterm: no persisted layout state for ${scopeLabel} in this workspace.`);
@@ -1541,7 +1590,7 @@ async function clearLayoutState(prefix: string, scopeLabel: string): Promise<voi
     for (const key of matching) {
         await activeCtx.workspaceState.update(key, undefined);
     }
-    log(`clearLayoutState: cleared ${matching.length} entries for ${scopeLabel} (prefix=${JSON.stringify(prefix)})`);
+    log(`clearLayoutState: cleared ${matching.length} entries for ${scopeLabel} (prefixes=${JSON.stringify(prefixes)})`);
     vscode.window.showInformationMessage(`dterm: cleared ${detail} for ${scopeLabel}. Reload window to see effect.`);
 }
 
@@ -2023,9 +2072,9 @@ export function activate(ctx: vscode.ExtensionContext): void {
 
     ctx.subscriptions.push(
         vscode.commands.registerCommand('dterm.clearLayoutForCurrentClient',
-            () => clearLayoutState(`client.${clientId}.`, 'current client')),
+            () => clearLayoutState([`client.${clientId}.`], 'current client')),
         vscode.commands.registerCommand('dterm.clearLayoutForAllClients',
-            () => clearLayoutState('client.', 'all clients')),
+            () => clearLayoutState(['client.', 'session.'], 'all clients')),
     );
 
     ctx.subscriptions.push(
