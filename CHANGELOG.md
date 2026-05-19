@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.7.1
+
+- New command "dterm: Clear persisted layout state for this client"
+  wipes all workspaceState keys prefixed with `client.<this-client-id>.`
+  in the current workspace. Other laptops connecting to the same
+  remote workspace are unaffected.
+- New command "dterm: Clear persisted layout state for all clients"
+  wipes every `client.*` key in the current workspace, regardless of
+  which client wrote it.
+
+Both commands prompt for confirmation with a summary of how many
+entries / clients / session labels will be cleared. The effect is
+visible after the next window reload; existing terminals continue to
+function and daemon sessions are not affected (use "dterm: Restart
+daemon" for that).
+
 ## 0.7.0
 
 `code` and `claude` CLIs now work in dterm shells across VS Code
