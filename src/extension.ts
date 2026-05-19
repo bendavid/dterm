@@ -14,9 +14,9 @@ const PROFILE_ID = 'dterm.profile';
 // U+200B (zero-width space) appended to every name dterm sets on a terminal:
 // the default `name: 'dterm'` for unrenamed sessions in TerminalOptions, and
 // every onDidChangeName fire driven by daemon-side process-name polling. Lets
-// us distinguish "name dterm set" from "name the user typed" without any race-
-// prone comparison against lastFiredName: a t.name carrying the marker is
-// ours, a t.name without it is a user inline-rename. Invisible in the UI.
+// us distinguish "name dterm set" from "name the user typed" by inspecting
+// t.name directly: a t.name carrying the marker is ours, a t.name without it
+// is a user inline-rename. Invisible in the UI.
 const FG_NAME_MARKER = '​';
 
 // Encode an ASCII session name into Unicode tag characters (U+E0020-U+E007E),
@@ -726,18 +726,9 @@ class DtermPseudoterminal implements vscode.Pseudoterminal {
     private cols: number;
     private rows: number;
     private term: vscode.Terminal | undefined;
-    // Last name we pushed via onDidChangeName. If t.name diverges from this we
-    // know a user rename happened (VS Code exposes no rename event).
-    private lastFiredName: string | undefined;
     // Locked once a user rename is observed (or once we restore a saved label).
     // While locked, daemon process_name updates do not override the visible name.
     private nameLocked: boolean;
-    // The user's clean inline-renamed value (no marker, no encoding) when a
-    // rename is active. Stored so we can re-apply it via applyUserLabel after
-    // any event that wipes our enriched value out of Api source (notably the
-    // user typing a fresh rename). Distinct from lastFiredName, which carries
-    // the enriched marker+encoding.
-    private userLabel: string | undefined;
     // The latest foreground process name the daemon reported, regardless of
     // whether the name is currently locked. Used to re-fire onDidChangeName
     // immediately when unlocking, so the user doesn't have to wait for the
@@ -789,13 +780,6 @@ class DtermPseudoterminal implements vscode.Pseudoterminal {
         this.cols = initialDims.cols;
         this.rows = initialDims.rows;
         this.nameLocked = restoredLabel !== undefined;
-        // Match the initial TerminalOptions.name set in buildPseudoOptions
-        // (encoded form), so snapshotLabels' nameMatchesOurSession check
-        // sees t.name as already-ours on the first tick and stays in the
-        // no-op branch instead of taking the user-rename path.
-        this.lastFiredName = restoredLabel !== undefined
-            ? nameWithSession(restoredLabel, sessionName)
-            : undefined;
         this.isReattach = isReattach;
         this.bootstrapPromise = bootstrap;
         if (bootstrap === undefined) {
@@ -853,11 +837,8 @@ class DtermPseudoterminal implements vscode.Pseudoterminal {
     // Suppresses subsequent daemon-driven process-name updates by locking,
     // which preserves the user's expressed intent.
     applyUserLabel(label: string): void {
-        this.userLabel = label;
         this.nameLocked = true;
-        const enriched = nameWithSession(label, this.sessionName);
-        this.nameEmitter.fire(enriched);
-        this.lastFiredName = enriched;
+        this.nameEmitter.fire(nameWithSession(label, this.sessionName));
     }
 
     open(initialDimensions: vscode.TerminalDimensions | undefined): void {
@@ -1012,9 +993,7 @@ class DtermPseudoterminal implements vscode.Pseudoterminal {
         // for unrenamed terminals all showing the same process name). The
         // marker is the visible-vs-encoded delimiter. Both are invisible in
         // the tab UI.
-        const marked = nameWithSession(name, this.sessionName);
-        this.nameEmitter.fire(marked);
-        this.lastFiredName = marked;
+        this.nameEmitter.fire(nameWithSession(name, this.sessionName));
     }
 
     // Re-enable dynamic process-name updates after a user clears their custom
@@ -1023,12 +1002,8 @@ class DtermPseudoterminal implements vscode.Pseudoterminal {
     // without waiting for the next daemon event.
     unlockName(): void {
         this.nameLocked = false;
-        this.userLabel = undefined;
-        this.lastFiredName = undefined;
         if (this.lastProcessNameSeen) {
-            const marked = nameWithSession(this.lastProcessNameSeen, this.sessionName);
-            this.nameEmitter.fire(marked);
-            this.lastFiredName = marked;
+            this.nameEmitter.fire(nameWithSession(this.lastProcessNameSeen, this.sessionName));
         }
     }
 
