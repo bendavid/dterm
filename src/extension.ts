@@ -612,10 +612,12 @@ interface ManagedSocket {
 // VSCODE_IPC_HOOK_CLI is the per-VS-Code-terminal socket that the `code` CLI
 // connects to. Rotates per terminal spawn (each terminal gets its own
 // socket, alive only while that terminal's pty-host process is alive). Our
-// keep-alive bootstrap stub holds one bound for the lifetime of each dterm
-// session; updating this symlink on each bootstrap (new + reattach) points
-// daemon-side shells at the current stub's socket, which keeps `code` CLI
-// working across VS Code window reload.
+// bootstrap stub's launcher script exec's into sleep after the node-based
+// env capture exits, so the kernel-level PID survives and VS Code keeps the
+// per-terminal CLIServer bound for the lifetime of each dterm session.
+// Updating this symlink on each bootstrap (new + reattach) points daemon-
+// side shells at the current stub's socket, which keeps `code` CLI working
+// across VS Code window reload.
 const MANAGED_SOCKETS: ManagedSocket[] = [
     { envVar: 'SSH_AUTH_SOCK',         linkName: 'ssh-auth.sock' },
     { envVar: 'VSCODE_GIT_IPC_HANDLE', linkName: 'vscode-git-ipc.sock' },
@@ -910,6 +912,7 @@ class DtermPseudoterminal implements vscode.Pseudoterminal {
             delete env.DTERM_BOOTSTRAP_SOCKET;
             delete env.DTERM_SESSION;
             delete env.DTERM_REAL_SHELL;
+            delete env.DTERM_STUB_PATH;
             // Apply our workspace-scoped symlink indirection for managed
             // sockets (SSH_AUTH_SOCK, VSCODE_GIT_IPC_HANDLE). We can't rely
             // on TerminalOptions.env to deliver these to the spawned shell
@@ -1087,11 +1090,13 @@ function stubPathForShell(shellBinary: string): { stubPath: string; shimName: st
 // the stub with. The visible Pseudoterminal hands this to the daemon in its
 // `open` message so the daemon-side shell spawns with the right env.
 //
-// Also carries the stub Terminal itself. The stub is kept alive (no longer
-// exits after writing its payload) so VS Code's per-terminal IPC socket --
-// whose path is captured in env.VSCODE_IPC_HOOK_CLI -- remains bound for the
-// lifetime of the dterm session. The Pseudoterminal disposes the stub in its
-// close() handler.
+// Also carries the stub Terminal itself. The node-based env-capture process
+// exits as soon as it has written the payload; the launcher script
+// (out/stub-launcher.sh) then exec's `sleep <large>` over its own image so
+// the kernel-level PID survives and VS Code's pty-host keeps the per-terminal
+// CLIServer for VSCODE_IPC_HOOK_CLI bound. The Pseudoterminal calls
+// stub.dispose() in its close() handler, which SIGHUPs the sleep and lets
+// VS Code clean up the pty + CLIServer.
 interface BootstrapResult {
     env: Record<string, string>;
     args: string[];
@@ -1100,9 +1105,12 @@ interface BootstrapResult {
 
 // Options for the hidden bootstrap stub: a real shell terminal whose only
 // purpose is to be spawned through VS Code's normal terminal pipeline so it
-// inherits shell-integration env injection. The stub writes the captured env
-// + argv to the per-session Unix socket whose path we pass via
-// DTERM_BOOTSTRAP_SOCKET and exits. No daemon involvement.
+// inherits shell-integration env injection. VS Code launches a launcher
+// shell script (out/shims/<basename> -> ../stub-launcher.sh) which invokes
+// the node-based capture (out/stub.js) to write the captured env + argv to
+// the per-session Unix socket at DTERM_BOOTSTRAP_SOCKET, then exec's into
+// sleep so the kernel-level PID keeps the pty bound for the session's
+// lifetime. No daemon involvement.
 function buildBootstrapStubOptions(
     sessionName: string,
     sockPath: string,
@@ -1113,16 +1121,19 @@ function buildBootstrapStubOptions(
     const { stubPath, shimName } = stubPathForShell(shellBinary);
     // The stub only needs enough env to know where to write its captured
     // payload (DTERM_BOOTSTRAP_SOCKET), to behave as Node when launched via
-    // Electron (ELECTRON_RUN_AS_NODE), and to know which real shell binary
-    // the daemon should spawn (DTERM_REAL_SHELL, when the shim basename
-    // doesn't match the configured shell). The managed-socket symlink
-    // indirection (SSH_AUTH_SOCK, VSCODE_GIT_IPC_HANDLE) is applied later,
-    // in the Pseudoterminal's connect() before the env is sent to the
-    // daemon, because TerminalOptions.env doesn't reliably override values
+    // Electron (ELECTRON_RUN_AS_NODE), to find stub.js from the launcher
+    // script (DTERM_STUB_PATH), and to know which real shell binary the
+    // daemon should spawn (DTERM_REAL_SHELL, when the shim basename doesn't
+    // match the configured shell). The managed-socket symlink indirection
+    // (SSH_AUTH_SOCK, VSCODE_GIT_IPC_HANDLE) is applied later, in the
+    // Pseudoterminal's connect() before the env is sent to the daemon,
+    // because TerminalOptions.env doesn't reliably override values
     // contributed by other extensions' EnvironmentVariableCollections.
     const env: { [key: string]: string } = {
         DTERM_SESSION: sessionName,
         DTERM_BOOTSTRAP_SOCKET: sockPath,
+        // stubPath is <ext>/out/shims/<basename>; stub.js lives one level up.
+        DTERM_STUB_PATH: path.join(path.dirname(stubPath), '..', 'stub.js'),
         ELECTRON_RUN_AS_NODE: '1',
     };
     if (shimName === 'dterm' || path.basename(shellBinary) !== shimName) {

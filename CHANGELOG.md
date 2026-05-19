@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.8.2
+
+Drop per-session keep-alive memory ~25-fold by `exec`ing into `sleep`
+after env capture instead of holding a node runtime open.
+
+- The bootstrap stub is now launched via a tiny POSIX shell wrapper
+  (`out/stub-launcher.sh`) that runs the node-based env capture and
+  then `exec`s into `sleep 2147483647`. The kernel-level PID survives
+  the `exec`, so VS Code's pty-host continues to see a single long-
+  lived persistent process and the per-terminal `VSCODE_IPC_HOOK_CLI`
+  CLIServer stays bound. Cross-reload behaviour is unchanged.
+- Per-session keep-alive RSS drops from ~30-50 MB (node + V8) to
+  ~1-2 MB (sleep). For workflows with many dterm sessions open at
+  once the savings are linear in session count.
+- `out/shims/{bash,zsh,fish,dterm}` now symlink to
+  `stub-launcher.sh` instead of `stub.js`. Shell-integration
+  basename detection is unaffected because VS Code keys on the
+  symlink's basename, not its target.
+- `out/stub.js` no longer holds a `setInterval` heartbeat; it exits
+  cleanly after writing the capture payload. The launcher's `exec
+  sleep` takes over keep-alive.
+- The launcher propagates the capture-process exit status: if
+  `out/stub.js` exits non-zero (e.g. bootstrap socket unreachable),
+  the launcher exits with the same status before `exec sleep`, so
+  the pty dies the same way it did pre-launcher.
+
 ## 0.8.1
 
 CI maintenance only -- no extension behaviour change.

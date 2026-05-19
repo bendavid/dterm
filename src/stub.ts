@@ -1,21 +1,22 @@
 #!/usr/bin/env node
-// dterm bootstrap stub.
+// dterm bootstrap stub -- env capture only.
 //
-// Launched as a hidden terminal by the main extension via VS Code's shellPath.
-// Captures VS Code's automatic shell-integration env injection (--init-file,
-// VSCODE_INJECTION, VSCODE_SHELL_INTEGRATION_NONCE, etc.) plus our argv, and
-// ships them back to the extension via a per-session Unix socket the extension
-// creates before spawning us.
+// Invoked by out/stub-launcher.sh, which is in turn launched by VS Code as a
+// hidden terminal via shellPath = out/shims/<basename>. We inherit VS Code's
+// per-terminal env injection (--init-file path in argv, VSCODE_INJECTION,
+// VSCODE_SHELL_INTEGRATION_NONCE, VSCODE_NONCE, the per-terminal
+// VSCODE_IPC_HOOK_CLI, plus every active extension's
+// EnvironmentVariableCollection contributions), serialize it as {env, args}
+// JSON, send it over the per-session Unix socket at DTERM_BOOTSTRAP_SOCKET,
+// and exit.
 //
-// After writing the payload, the stub STAYS ALIVE -- it does not exit. This
-// keeps VS Code's per-terminal IPC socket (path captured in our env above,
-// pointed at by VSCODE_IPC_HOOK_CLI) bound, so the daemon-side shell can use
-// the `code` CLI through that socket for the lifetime of the dterm session.
-// The extension calls Terminal.dispose() on us when the corresponding
-// Pseudoterminal closes; that's what eventually kills us.
-//
-// The socket path is passed in via DTERM_BOOTSTRAP_SOCKET. We write a single
-// JSON payload {env, args} and then sit idle indefinitely.
+// The pty stays bound after we exit because the launcher's next line is
+// `exec sleep <large>`. sleep replaces the launcher in-place, the kernel-
+// level PID does not change, so VS Code's pty-host continues to see the
+// same persistent process and the per-terminal CLIServer for
+// VSCODE_IPC_HOOK_CLI remains bound until Terminal.dispose() SIGHUPs us.
+// Keep-alive cost drops from ~30-50 MB (node + V8 runtime) to ~1-2 MB
+// (sleep) once we exit here.
 
 import * as net from 'net';
 
@@ -35,9 +36,6 @@ sock.on('error', e => {
     process.stderr.write(`dterm-stub: socket error: ${e.message}\n`);
     process.exit(3);
 });
-// Don't exit on socket 'close' -- the extension has the payload now, but VS
-// Code's IPC socket needs us alive to stay bound.
-
-// Keep the event loop alive indefinitely. Terminal.dispose() from the
-// extension will SIGHUP us and the process will exit normally.
-setInterval(() => { /* heartbeat */ }, 60_000);
+// Process exits naturally after the socket 'end' callback drains. The
+// launcher then execs into sleep to keep the pty bound for the session's
+// lifetime.
