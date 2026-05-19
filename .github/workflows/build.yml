@@ -6,6 +6,11 @@ on:
     tags: ['v*']
   pull_request:
   workflow_dispatch:
+    inputs:
+      publish:
+        description: 'Publish to VS Code Marketplace after building'
+        type: boolean
+        default: false
 
 env:
   ZIG_VERSION: '0.13.0'
@@ -180,3 +185,52 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh release create "${{ github.ref_name }}" artifacts/*.vsix --repo "${{ github.repository }}" --title "${{ github.ref_name }}" --generate-notes
+
+  publish-marketplace:
+    name: Publish to VS Code Marketplace
+    # Runs on either:
+    #   - a v* tag push (the auto-publish path), or
+    #   - a manual workflow_dispatch where the user ticked the "Publish to
+    #     VS Code Marketplace after building" checkbox.
+    # In both cases the linux+darwin jobs above have just rebuilt fresh
+    # VSIXes for the resolved ref, so we publish whatever was just built.
+    if: |
+      startsWith(github.ref, 'refs/tags/v') ||
+      (github.event_name == 'workflow_dispatch' && inputs.publish)
+    needs: [linux, darwin]
+    runs-on: ubuntu-24.04
+    # The `marketplace` GitHub Environment can be configured (Settings ->
+    # Environments) with required reviewers; the job then waits in the
+    # Actions UI until a reviewer approves before running. Configure this
+    # in repo settings -- without the environment-side protection rule,
+    # this job runs unconditionally whenever the `if:` above matches.
+    environment: marketplace
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Install vsce (already in devDependencies)
+        run: npm ci
+
+      - name: Publish per-target VSIXes
+        env:
+          VSCE_PAT: ${{ secrets.VSCE_PAT }}
+        # vsce publish --packagePath accepts multiple VSIX paths and reads
+        # each target back out of the embedded manifest (vsce package --target
+        # baked it in at build time), so the marketplace gets the right
+        # per-platform slice for each.
+        run: |
+          npx vsce publish --pat "$VSCE_PAT" --packagePath \
+            artifacts/dterm-linux-x64.vsix \
+            artifacts/dterm-linux-arm64.vsix \
+            artifacts/dterm-darwin-x64.vsix \
+            artifacts/dterm-darwin-arm64.vsix
