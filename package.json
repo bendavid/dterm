@@ -3,8 +3,9 @@
   "displayName": "dterm",
   "description": "Persistent terminal sessions per workspace with auto-reattach. Self-contained — no external daemon required.",
   "version": "0.10.0",
-  "publisher": "local",
+  "publisher": "joshbendavid",
   "license": "MIT",
+  "icon": "icon.png",
   "repository": {
     "type": "git",
     "url": "https://github.com/bendavid/dterm.git"
@@ -14,6 +15,15 @@
   },
   "categories": [
     "Other"
+  ],
+  "keywords": [
+    "terminal",
+    "persistent",
+    "session",
+    "reattach",
+    "tmux",
+    "screen",
+    "remote-ssh"
   ],
   "extensionKind": [
     "workspace"
