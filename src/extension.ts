@@ -771,16 +771,19 @@ class DtermPseudoterminal implements vscode.Pseudoterminal {
     readonly openPromise: Promise<void> = new Promise(r => { this.openResolve = r; });
 
     // Held so connect() can await the bootstrap-captured env+argv before
-    // sending the daemon `open` message (new sessions) and so reattach can
-    // hook the bootstrap.then() handler to refresh managed-socket symlinks
-    // even though we don't gate connect on it.
-    private readonly bootstrapPromise: Promise<BootstrapResult>;
+    // sending the daemon `open` message (new sessions only). Undefined on
+    // reattach: the daemon-side shell already exists with its baked-in
+    // env, and reconnectAll handles the workspace-scoped managed-socket
+    // symlink refresh up-front via one shared bootstrap before iterating
+    // sessions, so individual reattached Pseudoterminals don't need their
+    // own.
+    private readonly bootstrapPromise: Promise<BootstrapResult> | undefined;
 
     constructor(
         public readonly sessionName: string,
         restoredLabel: string | undefined,
         initialDims: { cols: number; rows: number },
-        bootstrap: Promise<BootstrapResult>,
+        bootstrap: Promise<BootstrapResult> | undefined,
         isReattach: boolean,
     ) {
         this.cols = initialDims.cols;
@@ -789,49 +792,36 @@ class DtermPseudoterminal implements vscode.Pseudoterminal {
         this.lastFiredName = restoredLabel;
         this.isReattach = isReattach;
         this.bootstrapPromise = bootstrap;
-        if (isReattach) {
-            // Daemon-side shell already exists; don't gate connect on the
-            // bootstrap. The bootstrap still runs to refresh the workspace-
-            // scoped managed-socket symlinks (SSH_AUTH_SOCK,
-            // VSCODE_GIT_IPC_HANDLE) against post-reload upstream paths --
-            // see the bootstrap.then() handler below.
+        if (bootstrap === undefined) {
+            // Reattach without per-session bootstrap. Daemon-side shell
+            // already exists and reconnectAll has already done the shared
+            // managed-socket refresh; nothing for us to wait on before
+            // connect.
             this.bootstrapDone = true;
+        } else {
+            bootstrap.then(
+                result => {
+                    this.bootstrapResult = result;
+                    // Update the workspace-scoped managed-socket symlinks
+                    // to point at the values just captured. For new sessions
+                    // the env we send to the daemon (with the symlink paths
+                    // substituted) is built in connect() below.
+                    refreshManagedSockets(result.env);
+                    if (!isReattach) {
+                        this.bootstrapDone = true;
+                        this.tryConnect();
+                    }
+                },
+                (e: Error) => {
+                    if (!isReattach) {
+                        this.pendingError = `dterm: failed to start shell: ${e.message}\r\n`;
+                        if (this.opened) this.flushError();
+                    } else {
+                        log(`bootstrap (reattach) failed for ${this.sessionName}: ${e.message}`);
+                    }
+                },
+            );
         }
-        bootstrap.then(
-            result => {
-                this.bootstrapResult = result;
-                // Update the workspace-scoped managed-socket symlinks to
-                // point at the values just captured by this bootstrap. For
-                // new sessions, the env we'll send to the daemon (with the
-                // symlink paths) is built in connect() below; for reattach,
-                // existing daemon-side shells already have the symlink paths
-                // baked in their env, and updating the symlink target here
-                // is what makes their `code` CLI / git-askpass / ssh-agent
-                // resolve to the current (post-reload) sockets without any
-                // env refresh on the shell side. Idempotent if the bootstrap
-                // for a new session already triggered an identical update
-                // via connect().
-                refreshManagedSockets(result.env);
-                if (!isReattach) {
-                    this.bootstrapDone = true;
-                    this.tryConnect();
-                }
-                // For reattach we don't use the captured env or args beyond
-                // the managed-socket refresh above; recorded as
-                // bootstrapResult only so future diagnostics can inspect.
-            },
-            (e: Error) => {
-                if (!isReattach) {
-                    this.pendingError = `dterm: failed to start shell: ${e.message}\r\n`;
-                    if (this.opened) this.flushError();
-                } else {
-                    // Reattach without a fresh stub just means no live IPC
-                    // socket for `code` CLI; the dterm session itself
-                    // continues to work via the existing daemon connection.
-                    log(`bootstrap (reattach) failed for ${this.sessionName}: ${e.message}`);
-                }
-            },
-        );
     }
 
     private flushError(): void {
@@ -1174,18 +1164,19 @@ function buildBootstrapStubOptions(
 
 // Options for the visible Pseudoterminal-backed terminal that the user
 // interacts with. Connects directly to the daemon via a Unix socket and
-// forwards stdio. `bootstrap` is always provided: for new sessions, its
-// captured env+argv get included in the daemon's `open` message; for
-// reattach, the captured env is only used to refresh the workspace-scoped
-// managed-socket symlinks against post-reload upstream values -- the
-// daemon-side shell already exists with its env baked in. `isReattach`
-// tells the Pseudoterminal which of the two it is.
+// forwards stdio. `bootstrap` is provided for new sessions only: its
+// captured env+argv get included in the daemon's `open` message. On
+// reattach `bootstrap` is undefined -- the daemon-side shell already
+// exists with its baked-in env, and reconnectAll does one shared
+// bootstrap up-front to refresh the workspace-scoped managed-socket
+// symlinks before iterating sessions. `isReattach` tells the
+// Pseudoterminal which of the two it is.
 function buildPseudoOptions(
     sessionName: string,
     label: string | undefined,
     viewColumn: number | undefined,
     initialDims: { cols: number; rows: number },
-    bootstrap: Promise<BootstrapResult>,
+    bootstrap: Promise<BootstrapResult> | undefined,
     isReattach: boolean,
     shellIntegrationNonce: string | undefined,
 ): vscode.ExtensionTerminalOptions {
@@ -1457,6 +1448,29 @@ async function reconnectAll(
         }
         return;
     }
+    // One shared bootstrap stub for the whole reattach pass. Its only job
+    // is to capture EnvironmentVariableCollection-contributed env values
+    // (most importantly the git extension's current VSCODE_GIT_IPC_HANDLE,
+    // which isn't in the extension host's own process.env) so
+    // refreshManagedSockets can retarget the workspace-scoped symlinks
+    // against post-reload upstream paths. The captured env is window-
+    // scoped, not per-terminal, so spawning N bootstraps for N sessions
+    // would be N times the work for an identical result. On bootstrap
+    // failure, fall back to refreshing from process.env only -- SSH_AUTH_
+    // SOCK and VSCODE_IPC_HOOK_CLI are there, only VSCODE_GIT_IPC_HANDLE
+    // would stay stale until the next successful refresh.
+    const reattachCwd = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    try {
+        const sharedBootstrap = await bootstrapShell(
+            `reattach-${process.pid}-${Date.now()}`,
+            reattachCwd,
+            undefined,
+        );
+        refreshManagedSockets(sharedBootstrap.env);
+    } catch (e) {
+        log(`reconnectAll: shared bootstrap failed: ${(e as Error).message}`);
+        refreshManagedSockets();
+    }
     const alreadyOpen = new Set(
         vscode.window.terminals.map(sessionNameOf).filter((n): n is string => Boolean(n)),
     );
@@ -1517,40 +1531,27 @@ async function reconnectAll(
         const meta = getMeta(name);
         log(`reconnectAll: creating terminal for ${name} (${meta?.viewColumn !== undefined ? `col ${meta.viewColumn} idx ${meta.tabIndex ?? 0}` : `panel idx ${meta?.panelIndex ?? '?'}`})`);
         // Reattach: the daemon-side shell already exists, so we don't need
-        // env/argv from the bootstrap. We still spawn one because its env
-        // capture is the only way to harvest the per-terminal-spawn
-        // EnvironmentVariableCollection contributions (the git extension's
-        // current VSCODE_GIT_IPC_HANDLE, Remote-SSH's current SSH_AUTH_SOCK)
-        // for refreshManagedSockets to retarget the workspace-scoped
-        // symlinks. The stub exits immediately after writing the payload;
-        // VSCODE_IPC_HOOK_CLI is retargeted from process.env (the extension-
-        // host CLIServer's current path), not from the stub's captured value.
-        const cwd = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+        // env/argv from a per-session bootstrap. The workspace-scoped
+        // managed-socket symlinks were already refreshed up-front via the
+        // single shared bootstrap at the top of this function; we pass
+        // undefined here so the Pseudoterminal skips the bootstrap.then()
+        // handler entirely.
+        //
         // Fetch the daemon-side shell's VSCODE_NONCE so the reattached
         // Pseudoterminal's parser validates the OSC 633 ; E sequences the
         // shell-integration script emits (Terminal.shellIntegration.
         // commandLine.isTrusted goes from false to true). The daemon-side
         // shell already has this value baked into its env from the
         // original session's bootstrap; we can't change it for an existing
-        // session, only consume it. Add ~one local-Unix-socket RTT to the
-        // per-session reattach time, which is dwarfed by the bootstrap-stub
-        // spawn cost we already pay below. Undefined nonce on fetch
-        // failure (timeout / session gone / pre-tier1 daemon) falls back
+        // session, only consume it. Adds ~one local-Unix-socket RTT to the
+        // per-session reattach time -- now the only async work in the
+        // per-session path. Undefined nonce on fetch failure falls back
         // to letting VS Code auto-generate one; trust validation stays
         // broken for that session but everything else keeps working.
         const sessionEnv = await fetchSessionEnv(name);
         const shellIntegrationNonce = sessionEnv?.VSCODE_NONCE;
-        // The reattach bootstrap stub does NOT get the nonce passed in --
-        // its captured VSCODE_NONCE is irrelevant because we already know
-        // the daemon-side shell's actual nonce from get_session_env above.
-        // Letting VS Code mint a throw-away one for the stub keeps the
-        // reattach stub's TerminalOptions minimal.
-        const bootstrap = bootstrapShell(name, cwd, undefined).catch(e => {
-            log(`reconnectAll: bootstrap (reattach) failed for ${name}: ${(e as Error).message}`);
-            throw e;
-        });
         const t = vscode.window.createTerminal(
-            buildPseudoOptions(name, meta?.label, meta?.viewColumn, { cols: 80, rows: 24 }, bootstrap, /*isReattach=*/true, shellIntegrationNonce),
+            buildPseudoOptions(name, meta?.label, meta?.viewColumn, { cols: 80, rows: 24 }, undefined, /*isReattach=*/true, shellIntegrationNonce),
         );
         terminalToSession.set(t, name);
         const pty = ptyBySession.get(name);

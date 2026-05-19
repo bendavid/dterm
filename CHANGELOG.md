@@ -1,5 +1,39 @@
 # Changelog
 
+## 0.9.1
+
+Reattach now spawns a single shared bootstrap stub instead of one per
+session.
+
+Per-session bootstraps on reattach were doing identical work N times:
+each captured the same window-scoped EnvironmentVariableCollection
+contributions (most importantly the git extension's current
+`VSCODE_GIT_IPC_HANDLE`) and fed them to `refreshManagedSockets`,
+which is idempotent. Hoist the bootstrap to the top of `reconnectAll`
+so one stub spawn refreshes the symlinks for the entire pass; the
+per-session reattach path then just creates the Pseudoterminal and
+talks to the daemon, with no bootstrap involvement.
+
+- `DtermPseudoterminal` accepts `bootstrap: Promise<BootstrapResult>
+  | undefined`. Undefined means reattach; the constructor skips the
+  `bootstrap.then()` handler entirely and marks `bootstrapDone = true`
+  immediately.
+- `reconnectAll` calls `bootstrapShell` once after the live-sessions
+  check, awaits it, and runs `refreshManagedSockets` with the
+  captured env. On bootstrap failure, falls back to refreshing from
+  `process.env` only (`SSH_AUTH_SOCK` and `VSCODE_IPC_HOOK_CLI` are
+  there; `VSCODE_GIT_IPC_HANDLE` stays stale until the next
+  successful refresh).
+- The per-session `bootstrapShell` call in the reattach loop is gone.
+- New-session path is unchanged: it still spawns a per-session
+  bootstrap because it actually needs the captured env+argv to send
+  in the daemon's `open` message.
+
+For a workspace with N reattached sessions, this saves N-1 bootstrap-
+stub spawns through VS Code's terminal pipeline (~30-50 ms each, plus
+N-1 hidden Terminal allocations and pty-host channels). Reattach
+becomes meaningfully faster for workspaces with several sessions.
+
 ## 0.9.0
 
 Route `code` CLI through the extension-host CLIServer instead of
