@@ -34,6 +34,35 @@ stub spawns through VS Code's terminal pipeline (~30-50 ms each, plus
 N-1 hidden Terminal allocations and pty-host channels). Reattach
 becomes meaningfully faster for workspaces with several sessions.
 
+---
+
+Also in this release: initial Pseudoterminal name now carries the
+tag-encoded session ID for restored-label terminals too.
+
+Previously, restored user labels were set as the initial
+`TerminalOptions.name` verbatim (no encoding). `snapshotLabels` then
+needed two seconds to detect the missing encoding and re-fire via
+`applyUserLabel` to put it back. During that window
+`getSessionFromTab` had to fall back to strict label-equality matching
+instead of decoding the embedded session id.
+
+Now `buildPseudoOptions` uniformly returns `nameWithSession(label ??
+'dterm', sessionName)`. Restored-label terminals carry the encoding
+from creation time, so:
+
+- Tab-to-session mapping decodes immediately on the first
+  `getSessionFromTab` call -- no fallback needed for the restored-label
+  path either.
+- `snapshotLabels`' `nameMatchesOurSession` check sees t.name as
+  already-ours on the first tick and stays in the no-op branch
+  instead of taking the user-rename path.
+- The encoding is zero-width, so the visible tab text is unchanged
+  from the user's perspective.
+
+The strict-label-equality fallback in `getSessionFromTab` is still
+present as a defensive measure for the genuine race between a user
+inline-rename and the next snapshot tick.
+
 ## 0.9.0
 
 Route `code` CLI through the extension-host CLIServer instead of

@@ -789,7 +789,13 @@ class DtermPseudoterminal implements vscode.Pseudoterminal {
         this.cols = initialDims.cols;
         this.rows = initialDims.rows;
         this.nameLocked = restoredLabel !== undefined;
-        this.lastFiredName = restoredLabel;
+        // Match the initial TerminalOptions.name set in buildPseudoOptions
+        // (encoded form), so snapshotLabels' nameMatchesOurSession check
+        // sees t.name as already-ours on the first tick and stays in the
+        // no-op branch instead of taking the user-rename path.
+        this.lastFiredName = restoredLabel !== undefined
+            ? nameWithSession(restoredLabel, sessionName)
+            : undefined;
         this.isReattach = isReattach;
         this.bootstrapPromise = bootstrap;
         if (bootstrap === undefined) {
@@ -1183,15 +1189,15 @@ function buildPseudoOptions(
     const pty = new DtermPseudoterminal(sessionName, label, initialDims, bootstrap, isReattach);
     ptyBySession.set(sessionName, pty);
     return {
-        // Default name carries the marker + tag-encoded session ID so the
-        // brief window between createTerminal and our first onDidChangeName
-        // fire still has tab.label carrying our identifier. Without it, a
-        // snapshotLocations call inside that window would fail to map the
-        // tab via getSessionFromTab (no encoding present, fallback label
-        // match would have nothing to match against). Restored user labels
-        // are kept verbatim; the constructor locks on them, and the
-        // getSessionFromTab fallback handles them via strict label match.
-        name: label ?? nameWithSession('dterm', sessionName),
+        // Initial name carries the marker + tag-encoded session ID from
+        // creation time so the brief window between createTerminal and our
+        // first onDidChangeName fire still has tab.label carrying our
+        // identifier -- getSessionFromTab decodes immediately without
+        // needing the strict-label-equality fallback. Applies to both the
+        // no-label path (visible "dterm") and the restored-label path
+        // (visible "<label>") since the encoding is zero-width and
+        // doesn't affect what the user sees.
+        name: nameWithSession(label ?? 'dterm', sessionName),
         pty,
         iconPath: activeCtx
             ? {
