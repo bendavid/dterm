@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.10.2
+
+Packaging cleanup.
+
+- Move `@vscode/vsce` from `dependencies` to `devDependencies` so it
+  isn't bundled into the published VSIX (it's only needed at
+  publish-time on the machine doing the upload, not at runtime).
+  Shrinks the VSIX significantly.
+- Bump `engines.vscode` floor to `^1.104.0` -- this is the first
+  release where `TerminalOptions.shellIntegrationNonce` and
+  `ExtensionTerminalOptions.shellIntegrationNonce` are present in
+  the public API (added in the August 2025 milestone, shipped in
+  1.104.0 on 2025-09-11). Older versions silently dropped the field
+  and the trust-validation feature didn't work.
+- `@types/vscode` bumped to match.
+- Add `dterm.tabTitle` to the README settings table -- it was in
+  package.json's contributed configuration but missing from the docs.
+
 ## 0.10.1
 
 Marketplace-ready metadata.

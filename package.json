@@ -2,7 +2,7 @@
   "name": "dterm",
   "displayName": "dterm",
   "description": "Persistent terminal sessions per workspace with auto-reattach. Self-contained — no external daemon required.",
-  "version": "0.10.1",
+  "version": "0.10.2",
   "publisher": "joshbendavid",
   "license": "MIT",
   "icon": "icon.png",
@@ -11,7 +11,7 @@
     "url": "https://github.com/bendavid/dterm.git"
   },
   "engines": {
-    "vscode": "^1.90.0"
+    "vscode": "^1.104.0"
   },
   "categories": [
     "Other"
@@ -134,14 +134,14 @@
     "vscode:prepublish": "npm run compile"
   },
   "dependencies": {
-    "@vscode/vsce": "^3.9.1",
     "@xterm/addon-serialize": "^0.13.0",
     "@xterm/headless": "^5.5.0",
     "node-pty": "^1.1.0"
   },
   "devDependencies": {
     "@types/node": "^20.11.0",
-    "@types/vscode": "^1.90.0",
+    "@types/vscode": "^1.104.0",
+    "@vscode/vsce": "^3.9.1",
     "typescript": "^5.4.5"
   }
 }

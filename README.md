@@ -60,6 +60,7 @@ This stops VS Code from spawning an unwanted default shell in the terminal panel
 | `dterm.scrollbackLines` | `0` | Daemon-side scrollback retention in lines, replayed on reattach. `0` follows `terminal.integrated.scrollback`. |
 | `dterm.shell` | `""` | Override the shell executable. Empty = `$SHELL` or `/bin/bash`. |
 | `dterm.shellArgs` | `[]` | Arguments passed to the shell on new sessions. |
+| `dterm.tabTitle` | `""` | Tab-title template for dterm terminals. When non-empty, overrides `terminal.integrated.tabs.title` for dterm sessions only. Supports the standard VS Code variables (`${process}`, `${cwd}`, `${cwdFolder}`, `${workspaceFolder}`, `${workspaceFolderName}`, `${sequence}`, `${separator}`) plus `${session}` (the dterm session id) and `${workspace}` (alias for `vscode.workspace.name`, stable across multi-root). Empty = inherit `terminal.integrated.tabs.title`. |
 
 ## How it compares
 
