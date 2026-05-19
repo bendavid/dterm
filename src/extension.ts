@@ -7,7 +7,14 @@ import * as net from 'net';
 import * as os from 'os';
 import { ensureDaemon, oneShot, readDaemonLogTail, isDaemonAlive } from './client';
 import { agentDir, daemonLogPath, socketPath } from './paths';
-import { encode, LineStream, type ClientMessage, type DaemonMessage } from './protocol';
+import {
+    encode,
+    LineStream,
+    type ClientMessage,
+    type DaemonMessage,
+    type SessionLayoutInfo,
+    type ClientSelection,
+} from './protocol';
 
 const PROFILE_ID = 'dterm.profile';
 
@@ -214,12 +221,12 @@ let pollTimer: NodeJS.Timeout | undefined;
 const pendingFocus = new Set<string>();
 
 // Per-session UI metadata (label, editor-area location, panel order). Stored
-// in activeCtx.workspaceState (on the remote in SSH scenarios) under keys
-// prefixed with a per-client UUID so two laptops connecting to the same
-// remote keep independent terminal layouts. The UUID itself lives in
-// SecretStorage, which is the only stable VS Code API that proxies storage
-// to the local client side -- different clients get different UUIDs because
-// each client's local OS keystore is independent.
+// on the daemon (one process per remote, shared across all attaching client
+// windows) and cached locally in layoutCache for fast reads. Labels are
+// workspace-shared (one value per session); positions are per-client,
+// scoped by the SecretStorage-stored clientId UUID so two laptops keep
+// independent layouts. See the layoutCache section below for the
+// architecture details and why workspaceState was abandoned.
 interface SessionMeta {
     label?: string;
     viewColumn?: number;
@@ -254,120 +261,188 @@ async function ensureClientId(ctx: vscode.ExtensionContext): Promise<void> {
     }
 }
 
-function metaKey(sessionName: string): string {
-    return `client.${clientId}.session.${sessionName}`;
+// All persistent layout state has moved off VS Code's workspaceState onto
+// the daemon. workspaceState is per-extension-host (each VS Code Server
+// window holds an exclusive lock on its own workspaceStorage/<hash>-N/
+// directory -- see extHostStoragePaths.ts in vscode), so it was never
+// actually a workspace-shared store on Remote-SSH; concurrent windows on
+// the same workspace each got an isolated state.vscdb. The daemon is one
+// process per remote regardless of how many client windows attach, so it
+// gives us:
+//
+//   - Workspace-shared labels (one value per session, all clients see the
+//     same one).
+//   - Per-client positions, scoped by the SecretStorage-stored clientId
+//     (which IS stable per laptop because SecretStorage proxies through to
+//     the local OS keystore).
+//   - Per-(client, workspace) selection memory (active terminal, panel-
+//     active, per-editor-column-active) on the same scoping.
+//
+// We keep a local CachedLayout populated at activation/reconnect time so
+// that frequent reads (every snapshotLocations tick, every tab-title
+// recompute) don't pay a daemon round-trip. Writes update the cache
+// synchronously and ship to the daemon via a oneShot RPC -- fire-and-
+// await for simplicity; daemon acks via `layout_ack`.
+//
+// Cache lifetime: re-populated whenever reconnectAll runs (activation,
+// reload, dterm.reconnect command). During a single extension-host
+// lifetime, the cache is the source of truth for *this* client's view;
+// other clients' writes don't appear until our next refresh, which is
+// acceptable because cross-client sync is naturally tied to reattach.
+
+interface CachedLayout {
+    selection: ClientSelection;
+    sessions: Map<string, SessionLayoutInfo>;
 }
 
-// User-set labels are stored in a workspace-shared keyspace (no client
-// prefix) so renaming a terminal on one laptop carries over to the other
-// laptops connecting to the same remote workspace. Positions stay per-client
-// (different monitors / screen real estate / preferences) but labels are
-// content judgements the user wants consistent. Last-write-wins; cross-
-// client visibility happens at the other client's next window reload (no
-// live change notification across extension hosts).
-function labelKey(sessionName: string): string {
-    return `session.${sessionName}.label`;
+let layoutCache: CachedLayout = {
+    selection: {},
+    sessions: new Map(),
+};
+
+async function daemonLayoutRpc<R extends DaemonMessage['type']>(
+    msg: ClientMessage,
+    expect: R,
+    timeoutMs = 2000,
+): Promise<Extract<DaemonMessage, { type: R }> | undefined> {
+    const resp = await oneShot(
+        daemonScriptPath(),
+        msg,
+        m => m.type === expect || m.type === 'error',
+        timeoutMs,
+    );
+    if (!resp) return undefined;
+    if (resp.type === 'error') {
+        log(`daemonLayoutRpc: ${msg.type} -> error: ${resp.message}`);
+        return undefined;
+    }
+    return resp as Extract<DaemonMessage, { type: R }>;
 }
 
-const LABEL_KEY_PREFIX = 'session.';
-const LABEL_KEY_SUFFIX = '.label';
-
-function activeKey(): string {
-    return `client.${clientId}.active`;
-}
-
-// Tracks the most recent panel terminal that was the global active terminal.
-// Distinct from activeKey because a panel terminal still has a "selected tab"
-// state even when the global active is an editor-area terminal -- reattach
-// needs to restore both so the panel reopens at the right tab.
-function panelActiveKey(): string {
-    return `client.${clientId}.panel-active`;
-}
-
-// Per-editor-column active session. Distinct from activeKey because each
-// editor group keeps its own selected tab independent of the global active
-// terminal -- reattach needs to restore each column to whichever dterm was
-// last selected there even when the global focus was elsewhere.
-function editorActiveKey(viewColumn: number): string {
-    return `client.${clientId}.editor-active.${viewColumn}`;
-}
-
-function editorActivePrefix(): string {
-    return `client.${clientId}.editor-active.`;
+// Pull the full layout view for this client from the daemon. Refreshes
+// layoutCache wholesale. Called from reconnectAll and after the
+// clearLayout commands; could also be invoked manually via the dump
+// command if we want a refresh-then-show shape.
+async function loadLayoutFromDaemon(): Promise<void> {
+    const tag = workspaceTag();
+    if (!tag) {
+        layoutCache = { selection: {}, sessions: new Map() };
+        return;
+    }
+    const resp = await daemonLayoutRpc(
+        { type: 'list', clientId, workspaceTag: tag },
+        'list_response',
+    );
+    if (!resp) {
+        // Daemon unreachable. Leave any existing cache in place rather than
+        // wiping -- the user's session positions / labels shouldn't vanish
+        // just because the daemon briefly didn't respond.
+        log('loadLayoutFromDaemon: daemon unreachable, keeping existing cache');
+        return;
+    }
+    const sessionsMap = new Map<string, SessionLayoutInfo>();
+    for (const s of (resp.sessions ?? [])) sessionsMap.set(s.name, s);
+    layoutCache = {
+        selection: resp.selection ?? {},
+        sessions: sessionsMap,
+    };
+    log(`loadLayoutFromDaemon: ${sessionsMap.size} sessions, selection=${JSON.stringify(layoutCache.selection)}`);
 }
 
 function getActive(): string | undefined {
-    if (!activeCtx) return undefined;
-    return activeCtx.workspaceState.get<string>(activeKey());
+    return layoutCache.selection.active;
 }
 
 async function setActive(sessionName: string | undefined): Promise<void> {
-    if (!activeCtx) return;
-    await activeCtx.workspaceState.update(activeKey(), sessionName);
+    layoutCache.selection.active = sessionName;
+    const tag = workspaceTag();
+    if (!tag) return;
+    await daemonLayoutRpc(
+        { type: 'set_client_selection', clientId, workspaceTag: tag, selection: { active: sessionName } },
+        'layout_ack',
+    );
 }
 
 function getPanelActive(): string | undefined {
-    if (!activeCtx) return undefined;
-    return activeCtx.workspaceState.get<string>(panelActiveKey());
+    return layoutCache.selection.panelActive;
 }
 
 async function setPanelActive(sessionName: string | undefined): Promise<void> {
-    if (!activeCtx) return;
-    await activeCtx.workspaceState.update(panelActiveKey(), sessionName);
+    layoutCache.selection.panelActive = sessionName;
+    const tag = workspaceTag();
+    if (!tag) return;
+    await daemonLayoutRpc(
+        { type: 'set_client_selection', clientId, workspaceTag: tag, selection: { panelActive: sessionName } },
+        'layout_ack',
+    );
 }
 
 function getEditorActive(viewColumn: number): string | undefined {
-    if (!activeCtx) return undefined;
-    return activeCtx.workspaceState.get<string>(editorActiveKey(viewColumn));
+    return layoutCache.selection.editorActive?.[viewColumn];
 }
 
 async function setEditorActive(viewColumn: number, sessionName: string | undefined): Promise<void> {
-    if (!activeCtx) return;
-    await activeCtx.workspaceState.update(editorActiveKey(viewColumn), sessionName);
+    const current = { ...(layoutCache.selection.editorActive ?? {}) };
+    if (sessionName === undefined) {
+        delete current[viewColumn];
+    } else {
+        current[viewColumn] = sessionName;
+    }
+    layoutCache.selection.editorActive = current;
+    const tag = workspaceTag();
+    if (!tag) return;
+    await daemonLayoutRpc(
+        { type: 'set_client_selection', clientId, workspaceTag: tag, selection: { editorActive: current } },
+        'layout_ack',
+    );
 }
 
-// Per-client meta fields (positions). label lives in a separate workspace-
-// shared keyspace -- see labelKey() above.
+// Per-client meta fields (positions). label is workspace-shared.
 type SessionMetaPerClient = Omit<SessionMeta, 'label'>;
 
 function getMeta(sessionName: string): SessionMeta | undefined {
-    if (!activeCtx) return undefined;
-    const perClient = activeCtx.workspaceState.get<SessionMetaPerClient>(metaKey(sessionName));
-    const label = activeCtx.workspaceState.get<string>(labelKey(sessionName));
-    if (!perClient && label === undefined) return undefined;
-    return { ...perClient, label };
+    const entry = layoutCache.sessions.get(sessionName);
+    if (!entry) return undefined;
+    const { position, label } = entry;
+    if (!position && label === undefined) return undefined;
+    return { ...position, label };
 }
 
-// Writes go through separate setters so position-only callers (the 2s
-// snapshotLocations poll) never touch the shared label store. With a single
-// combined setter, the natural `setMeta(sName, { ...current, viewColumn: ... })`
-// spread on client B would read B's in-memory label, which is stale relative
-// to a concurrent rename by client A (VS Code's workspaceState has no cross-
-// extension-host change notification -- each host has its own in-memory copy
-// and only sees its own writes during runtime). B's position snapshot would
-// then write its stale label back to the shared store, silently clobbering
-// A's recent rename on disk. Splitting the writers means position snapshots
-// only touch per-client keys, so the only path that writes the shared label
-// store is the explicit rename-detection path in snapshotLabels.
 async function setLabel(sessionName: string, label: string | undefined): Promise<void> {
-    if (!activeCtx) return;
-    log(`setLabel session=${sessionName} label=${JSON.stringify(label)} key=${labelKey(sessionName)}`);
-    await activeCtx.workspaceState.update(labelKey(sessionName), label);
+    log(`setLabel session=${sessionName} label=${JSON.stringify(label)}`);
+    let entry = layoutCache.sessions.get(sessionName);
+    if (!entry) {
+        entry = { name: sessionName };
+        layoutCache.sessions.set(sessionName, entry);
+    }
+    entry.label = label;
+    await daemonLayoutRpc(
+        { type: 'set_session_label', name: sessionName, label: label ?? null },
+        'layout_ack',
+    );
 }
 
 async function setPosition(sessionName: string, perClient: SessionMetaPerClient): Promise<void> {
-    if (!activeCtx) return;
     const empty = perClient.viewColumn === undefined
         && perClient.tabIndex === undefined
         && perClient.panelIndex === undefined;
-    await activeCtx.workspaceState.update(metaKey(sessionName), empty ? undefined : perClient);
+    let entry = layoutCache.sessions.get(sessionName);
+    if (!entry) {
+        entry = { name: sessionName };
+        layoutCache.sessions.set(sessionName, entry);
+    }
+    entry.position = empty ? undefined : perClient;
+    await daemonLayoutRpc(
+        { type: 'set_session_position', name: sessionName, clientId, position: empty ? null : perClient },
+        'layout_ack',
+    );
 }
 
 async function clearMeta(sessionName: string): Promise<void> {
-    if (!activeCtx) return;
+    layoutCache.sessions.delete(sessionName);
     await Promise.all([
-        activeCtx.workspaceState.update(metaKey(sessionName), undefined),
-        activeCtx.workspaceState.update(labelKey(sessionName), undefined),
+        daemonLayoutRpc({ type: 'set_session_label', name: sessionName, label: null }, 'layout_ack'),
+        daemonLayoutRpc({ type: 'set_session_position', name: sessionName, clientId, position: null }, 'layout_ack'),
     ]);
 }
 
@@ -600,47 +675,18 @@ function ensurePolling(): void {
     pollTimer.unref?.();
 }
 
-function pruneStaleMeta(liveSessionNames: Set<string>): void {
-    if (!activeCtx) return;
-    const sessionPrefix = `client.${clientId}.session.`;
-    for (const key of activeCtx.workspaceState.keys()) {
-        // Per-client session meta (positions).
-        if (key.startsWith(sessionPrefix)) {
-            const session = key.slice(sessionPrefix.length);
-            if (!liveSessionNames.has(session)) {
-                void activeCtx.workspaceState.update(key, undefined);
-            }
-            continue;
-        }
-        // Workspace-shared session label keys (`session.<name>.label`).
-        // Pruned by every client that runs reconnectAll; whichever runs first
-        // wins. Safe because the shared store has a single entry per session,
-        // not per-client.
-        if (key.startsWith(LABEL_KEY_PREFIX) && key.endsWith(LABEL_KEY_SUFFIX)) {
-            const session = key.slice(LABEL_KEY_PREFIX.length, -LABEL_KEY_SUFFIX.length);
-            if (!liveSessionNames.has(session)) {
-                void activeCtx.workspaceState.update(key, undefined);
-            }
-            continue;
-        }
-    }
-    // Drop the saved-active and panel-active keys if they point at dead
-    // sessions, so reattach doesn't try to focus a nonexistent terminal.
-    const active = getActive();
-    if (active && !liveSessionNames.has(active)) {
-        void setActive(undefined);
-    }
-    const panelActive = getPanelActive();
-    if (panelActive && !liveSessionNames.has(panelActive)) {
-        void setPanelActive(undefined);
-    }
-    // Drop per-editor-column active entries that point at dead sessions.
-    const editorPrefix = editorActivePrefix();
-    for (const key of activeCtx.workspaceState.keys()) {
-        if (!key.startsWith(editorPrefix)) continue;
-        const value = activeCtx.workspaceState.get<string>(key);
-        if (value && !liveSessionNames.has(value)) {
-            void activeCtx.workspaceState.update(key, undefined);
+// Drop selection slots that point at sessions that no longer exist in the
+// daemon's live list. Positions and labels for dead sessions are cleaned up
+// daemon-side when the session itself dies (Session struct + its positions
+// Map are released), so the extension only has to handle the selection
+// memory it cached locally.
+async function pruneStaleSelection(liveSessionNames: Set<string>): Promise<void> {
+    const sel = layoutCache.selection;
+    if (sel.active && !liveSessionNames.has(sel.active)) await setActive(undefined);
+    if (sel.panelActive && !liveSessionNames.has(sel.panelActive)) await setPanelActive(undefined);
+    if (sel.editorActive) {
+        for (const [col, name] of Object.entries(sel.editorActive)) {
+            if (!liveSessionNames.has(name)) await setEditorActive(Number(col), undefined);
         }
     }
 }
@@ -1588,7 +1634,12 @@ async function reconnectAll(
         return;
     }
     const ours = live.names.filter(n => n.startsWith(prefix));
-    pruneStaleMeta(new Set(ours));
+    // Pull the daemon's view of labels, per-client positions, and per-
+    // (client, workspace) selection state into layoutCache before any
+    // subsequent getMeta / getActive call. Without this, reads would
+    // return stale data from the previous extension-host lifetime.
+    await loadLayoutFromDaemon();
+    await pruneStaleSelection(new Set(ours));
     if (ours.length === 0) {
         if (opts?.interactive) {
             vscode.window.showInformationMessage(
@@ -1678,7 +1729,7 @@ async function reconnectAll(
             continue;
         }
         const meta = getMeta(name);
-        log(`reconnectAll: creating terminal for ${name} (${meta?.viewColumn !== undefined ? `col ${meta.viewColumn} idx ${meta.tabIndex ?? 0}` : `panel idx ${meta?.panelIndex ?? '?'}`}) meta=${JSON.stringify(meta)} labelKey=${labelKey(name)}`);
+        log(`reconnectAll: creating terminal for ${name} (${meta?.viewColumn !== undefined ? `col ${meta.viewColumn} idx ${meta.tabIndex ?? 0}` : `panel idx ${meta?.panelIndex ?? '?'}`}) meta=${JSON.stringify(meta)}`);
         // Reattach: the daemon-side shell already exists, so we don't need
         // env/argv from a per-session bootstrap. The workspace-scoped
         // managed-socket symlinks were already refreshed up-front via the
@@ -1779,61 +1830,53 @@ async function reconnectAll(
     setTimeout(() => logTabGroupsState('post-reconnect'), 500);
 }
 
-// Delete all workspaceState keys starting with any of the given prefixes.
-// Used by the dterm.clearLayout commands:
-//   - current client: prefixes = [`client.${clientId}.`]
-//   - all clients:    prefixes = [`client.`, `session.`]  (also wipes the
-//                                   shared session-label store)
-// Clearing layout state doesn't dispose existing dterm terminals or kill
-// daemon sessions; the effect is visible on the next reload, when
-// reconnectAll rebuilds layout from scratch without the previously-saved
-// meta.
-async function clearLayoutState(prefixes: string[], scopeLabel: string): Promise<void> {
-    if (!activeCtx) return;
-    // Enumerate matching keys + collect summary stats for the confirm dialog.
-    const matching: string[] = [];
-    const clientIds = new Set<string>();
-    const sessions = new Set<string>();
-    for (const key of activeCtx.workspaceState.keys()) {
-        if (!prefixes.some(p => key.startsWith(p))) continue;
-        matching.push(key);
-        const clientMatch = key.match(/^client\.([^.]+)\.(.+)$/);
-        if (clientMatch) {
-            clientIds.add(clientMatch[1]);
-            const sessionMatch = clientMatch[2].match(/^session\.(.+)$/);
-            if (sessionMatch) sessions.add(sessionMatch[1]);
-            continue;
-        }
-        const labelMatch = key.match(/^session\.(.+)\.label$/);
-        if (labelMatch) sessions.add(labelMatch[1]);
-    }
-    if (matching.length === 0) {
-        vscode.window.showInformationMessage(`dterm: no persisted layout state for ${scopeLabel} in this workspace.`);
+// Ask the daemon to clear persisted layout state. Two variants:
+//   - 'current': clear *this* client's layout (positions for sessions in
+//     this workspace, plus selection state for this client in this
+//     workspace). Labels are workspace-shared and untouched.
+//   - 'all':     clear every client's layout for this workspace AND the
+//     workspace-shared labels.
+// Daemon sessions themselves are not killed; the effect is visible on the
+// next reload when reconnectAll rebuilds layout from the now-empty store.
+async function clearLayoutState(scope: 'current' | 'all'): Promise<void> {
+    const tag = workspaceTag();
+    if (!tag) {
+        vscode.window.showInformationMessage('dterm: no workspace open.');
         return;
     }
-    const detail = `${matching.length} entries (${clientIds.size} client${clientIds.size === 1 ? '' : 's'}, ${sessions.size} session label${sessions.size === 1 ? '' : 's'})`;
+    const scopeLabel = scope === 'current' ? 'current client' : 'all clients';
     const choice = await vscode.window.showWarningMessage(
         `dterm: clear persisted layout state for ${scopeLabel} in this workspace?`,
         {
             modal: true,
-            detail: `${detail}. Existing terminals continue to work; the effect of clearing shows up on the next window reload, when reconnectAll rebuilds layout without the saved meta. Daemon sessions are not affected -- use "dterm: Restart daemon" if you also want to terminate live sessions.`,
+            detail: `Existing terminals continue to work; the effect of clearing shows up on the next window reload, when reconnectAll rebuilds layout without the saved meta. Daemon sessions are not affected -- use "dterm: Restart daemon" if you also want to terminate live sessions.`,
         },
         'Clear',
     );
     if (choice !== 'Clear') return;
-    for (const key of matching) {
-        await activeCtx.workspaceState.update(key, undefined);
+    const resp = await daemonLayoutRpc(
+        scope === 'current'
+            ? { type: 'clear_client_layout', clientId, workspaceTag: tag }
+            : { type: 'clear_all_layouts', workspaceTag: tag },
+        'layout_ack',
+        5000,
+    );
+    if (!resp) {
+        vscode.window.showErrorMessage('dterm: daemon unreachable; nothing cleared.');
+        return;
     }
-    log(`clearLayoutState: cleared ${matching.length} entries for ${scopeLabel} (prefixes=${JSON.stringify(prefixes)})`);
-    vscode.window.showInformationMessage(`dterm: cleared ${detail} for ${scopeLabel}. Reload window to see effect.`);
+    // Resync our local cache from the now-cleared daemon state.
+    await loadLayoutFromDaemon();
+    const n = resp.cleared ?? 0;
+    log(`clearLayoutState: scope=${scope} cleared=${n}`);
+    vscode.window.showInformationMessage(`dterm: cleared ${n} entries for ${scopeLabel}. Reload window to see effect.`);
 }
 
-// Diagnostic: dump every dterm-related workspaceState key (with values),
-// the resolved clientId / workspaceTag / hostname / pid, both VS Code
-// storage paths the extension can see, and the result of getMeta() for
-// each live daemon session. Used to triage label/position persistence
-// issues by running on each client (the one that wrote, then the one that
-// failed to restore) and diffing the outputs.
+// Diagnostic: dump the layout view this client currently has, after a
+// fresh pull from the daemon. Includes clientId / workspaceTag identity,
+// the client's selection state (active / panelActive / editorActive), and
+// each live session's label and per-client position. Used to verify
+// cross-client persistence is working as expected.
 let dumpLayoutChannel: vscode.OutputChannel | undefined;
 async function dumpLayoutState(): Promise<void> {
     if (!activeCtx) {
@@ -1843,15 +1886,10 @@ async function dumpLayoutState(): Promise<void> {
     if (!dumpLayoutChannel) dumpLayoutChannel = vscode.window.createOutputChannel('dterm: layout state dump');
     const ch = dumpLayoutChannel;
     ch.clear();
-    const live = await fetchDaemonSessions();
     const tag = workspaceTag() ?? '(none)';
-    // Per-extension-per-workspace storage URI. The state.vscdb that holds
-    // workspaceState rows lives one directory up (workspaceStorage/<hash>/
-    // state.vscdb); print both so the user can find the right sqlite file
-    // to inspect directly if needed.
-    const extStorage = activeCtx.storageUri?.fsPath ?? '(none)';
-    const workspaceStorageDir = activeCtx.storageUri ? path.dirname(activeCtx.storageUri.fsPath) : '(none)';
-    const globalStorage = activeCtx.globalStorageUri?.fsPath ?? '(none)';
+    // Pull a fresh layout view from the daemon (also updates layoutCache).
+    await loadLayoutFromDaemon();
+    const live = await fetchDaemonSessions();
     ch.appendLine('=== dterm layout-state dump ===');
     ch.appendLine(`timestamp:            ${new Date().toISOString()}`);
     ch.appendLine(`hostname:             ${os.hostname()}`);
@@ -1863,25 +1901,9 @@ async function dumpLayoutState(): Promise<void> {
     ch.appendLine(`vscode.workspace.name:${vscode.workspace.name ?? '(none)'}`);
     ch.appendLine(`workspaceFile:        ${vscode.workspace.workspaceFile?.fsPath ?? '(none)'}`);
     ch.appendLine(`workspaceFolders:     ${JSON.stringify((vscode.workspace.workspaceFolders ?? []).map(f => f.uri.fsPath))}`);
-    ch.appendLine(`extension storageUri: ${extStorage}`);
-    ch.appendLine(`workspaceStorage dir: ${workspaceStorageDir}`);
-    ch.appendLine(`  (state.vscdb should be at ${workspaceStorageDir}/state.vscdb)`);
-    ch.appendLine(`globalStorageUri:     ${globalStorage}`);
     ch.appendLine('');
-    ch.appendLine('--- workspaceState keys (dterm-relevant) ---');
-    const keys = [...activeCtx.workspaceState.keys()].sort();
-    const relevant = keys.filter(k =>
-        k.startsWith('client.')
-        || (k.startsWith('session.') && k.endsWith('.label')),
-    );
-    if (relevant.length === 0) {
-        ch.appendLine('(none)');
-    } else {
-        for (const k of relevant) {
-            const v = activeCtx.workspaceState.get(k);
-            ch.appendLine(`  ${k} = ${JSON.stringify(v)}`);
-        }
-    }
+    ch.appendLine('--- layoutCache.selection (this client, this workspace) ---');
+    ch.appendLine(`  ${JSON.stringify(layoutCache.selection)}`);
     ch.appendLine('');
     ch.appendLine('--- live daemon sessions (this workspace) ---');
     if (!live) {
@@ -1894,10 +1916,11 @@ async function dumpLayoutState(): Promise<void> {
         }
         for (const name of ours) {
             const meta = getMeta(name);
+            const cached = layoutCache.sessions.get(name);
             ch.appendLine(`  ${name}`);
-            ch.appendLine(`    labelKey:  ${labelKey(name)}`);
-            ch.appendLine(`    metaKey:   ${metaKey(name)}`);
-            ch.appendLine(`    getMeta(): ${JSON.stringify(meta)}`);
+            ch.appendLine(`    label:           ${JSON.stringify(cached?.label)}`);
+            ch.appendLine(`    position:        ${JSON.stringify(cached?.position)}`);
+            ch.appendLine(`    getMeta():       ${JSON.stringify(meta)}`);
         }
     }
     ch.appendLine('');
@@ -2428,9 +2451,9 @@ export function activate(ctx: vscode.ExtensionContext): void {
 
     ctx.subscriptions.push(
         vscode.commands.registerCommand('dterm.clearLayoutForCurrentClient',
-            () => clearLayoutState([`client.${clientId}.`], 'current client')),
+            () => clearLayoutState('current')),
         vscode.commands.registerCommand('dterm.clearLayoutForAllClients',
-            () => clearLayoutState(['client.', 'session.'], 'all clients')),
+            () => clearLayoutState('all')),
         vscode.commands.registerCommand('dterm.dumpLayoutState', () => dumpLayoutState()),
     );
 
@@ -2487,16 +2510,21 @@ export function activate(ctx: vscode.ExtensionContext): void {
     );
 
     void (async () => {
-        // Resolve clientId BEFORE any code path reads workspaceState -- every
-        // key derives from `client.${clientId}.<...>`, so reading with a
-        // fallback machineId-based prefix would miss values persisted under
-        // the real UUID.
+        // Resolve clientId before any layout RPC -- every per-client write
+        // (set_session_position, set_client_selection) keys on this UUID,
+        // and a fallback machineId-based identity would partition this
+        // client's state across activations.
         await ensureClientId(ctx);
         logTabGroupsState('activate');
         const { restarted } = await checkDaemonVersion(ctx);
         if (restarted) return;
         if (vscode.workspace.getConfiguration('dterm').get<boolean>('autoReconnect', true)) {
             await reconnectAll(ctx);
+        } else {
+            // No reconnect, but still need the layout cache populated so
+            // any session created later (via the profile provider) writes
+            // to a consistent view of daemon state.
+            await loadLayoutFromDaemon();
         }
     })();
 }
@@ -2506,9 +2534,10 @@ export async function deactivate(): Promise<void> {
         clearInterval(pollTimer);
         pollTimer = undefined;
     }
-    // Await so that workspaceState writes for label/location/active flush
-    // before VS Code releases the workspace state on shutdown -- otherwise
-    // the next workspace load sees stale data.
+    // Await so daemon RPCs from snapshotLabels / snapshotLocations complete
+    // before we drop activeCtx -- otherwise a pending set_session_position
+    // or set_session_label could fire after the cache is torn down and end
+    // up writing inconsistent state to the daemon.
     try {
         await Promise.all([snapshotLabels(), snapshotLocations()]);
     } catch (e) {

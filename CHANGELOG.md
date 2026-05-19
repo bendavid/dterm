@@ -1,5 +1,91 @@
 # Changelog
 
+## 0.10.0
+
+Move all persistent layout state from VS Code's `workspaceState` onto the
+daemon.
+
+VS Code Server's `extHostStoragePaths.ts` exclusive-locks the canonical
+`workspaceStorage/<hash>/` directory with `vscode.lock` per extension-host
+process; concurrent windows on the same workspace fall through to
+`<hash>-1/`, `<hash>-2/`, etc. (heartbeat-refreshed lock, 10-minute
+staleness threshold, separate `state.vscdb` in each suffixed dir). That
+made workspaceState a per-extension-host-instance store on Remote-SSH
+rather than the workspace-scoped store we'd been treating it as: writes
+from one client window were invisible to other client windows opening
+the same workspace, and a single client's writes could even disappear
+across its own reload if VS Code Server lock-routed it into a different
+suffix the next time. Labels never propagated cross-client; per-client
+positions were silently partitioned across whatever subset of
+`<hash>-N` dirs that client happened to land on.
+
+Daemon-side storage was the correct model all along: one process per
+remote regardless of window count, no lock fragmentation, lifetime
+matches scrollback / shell-integration state which already live there.
+
+Architectural changes:
+
+- `Session` on the daemon gains `label?: string` (workspace-shared
+  across all clients) and `positions: Map<string, SessionPosition>`
+  (keyed by clientId, scoped per-client).
+- New top-level `clientSelections: Map<clientId, Map<workspaceTag,
+  ClientSelection>>` tracks each client's per-workspace selection
+  memory (active session, panel-active, per-editor-column-active).
+  Lives outside `Session` so selection survives individual session
+  death/recreate within a workspace.
+- New protocol messages: `set_session_label`, `set_session_position`,
+  `set_client_selection`, `clear_client_layout`,
+  `clear_all_layouts`. All daemon-acked via the new `layout_ack`
+  reply.
+- `list` request gains optional `clientId` + `workspaceTag`
+  parameters. When provided, `list_response` includes a `sessions`
+  array (each entry = `{ name, label?, position? }` filtered to the
+  requesting clientId) and a `selection` object scoped to
+  `(clientId, workspaceTag)`. Existing `names` field preserved for
+  back-compat with diagnostic-only callers.
+- Extension keeps a local `layoutCache` populated at activation /
+  reconnect via the augmented `list` RPC. All `getMeta` / `getActive`
+  / `getPanelActive` / `getEditorActive` reads come from the cache;
+  all setters update the cache synchronously and ship a oneShot RPC
+  to the daemon.
+
+Surface-level cleanups:
+
+- `metaKey`, `labelKey`, `activeKey`, `panelActiveKey`,
+  `editorActiveKey`, `editorActivePrefix`, `LABEL_KEY_PREFIX`,
+  `LABEL_KEY_SUFFIX` -- all removed; nothing keys workspaceState
+  anymore.
+- `pruneStaleMeta` replaced with `pruneStaleSelection`: only
+  selection slots need extension-side pruning since daemon-side
+  positions and labels are released automatically when the session
+  dies (Session struct + its positions map go with it).
+- `clearLayoutState` rewritten to send `clear_client_layout` /
+  `clear_all_layouts` to the daemon; the `dterm: Clear persisted
+  layout state for...` commands hit the daemon now. Returns the
+  daemon's `cleared` count in the status message.
+- `dterm.dumpLayoutState` rewritten to pull from the daemon (via
+  `loadLayoutFromDaemon`) and show `layoutCache.selection` + each
+  session's label / position. Storage-path inspection dropped --
+  it was misleading on Remote-SSH anyway (the API-reported path
+  didn't disambiguate the `-N` suffix).
+
+Behavioural improvements:
+
+- Labels propagate across concurrent client windows (writes hit the
+  daemon, all attached clients see them via `list`).
+- Per-client positions survive workspaceStorage lock-routing
+  decisions (clientId is stable per laptop because SecretStorage
+  proxies to the local OS keystore; positions are keyed on that, not
+  on which `<hash>-N` directory VS Code Server happened to lock-route
+  the extension host into).
+- Selection memory ditto.
+
+No disk persistence on the daemon side. Layout state lives in memory
+only and is lost on daemon restart / explicit `dterm: Restart
+daemon` -- intentional, matches scrollback. The underlying daemon
+sessions tied to the layout state would be killed by the same daemon
+restart anyway, so the layout is irrelevant once they're gone.
+
 ## 0.9.3
 
 Honour `terminal.integrated.tabs.title` for dterm Pseudoterminals.

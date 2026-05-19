@@ -3,7 +3,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { socketPath } from './paths';
 import { LineStream, encode } from './protocol';
-import type { ClientMessage, DaemonMessage } from './protocol';
+import type { ClientMessage, DaemonMessage, SessionLayoutInfo, SessionPosition, ClientSelection } from './protocol';
 
 import type * as ptyTypes from 'node-pty';
 import { Terminal } from '@xterm/headless';
@@ -138,6 +138,43 @@ interface Session {
     // though VS Code's Pseudoterminal parser doesn't expose its own
     // sequence-source title via the public API.
     sequenceTitle: string;
+    // Persistent layout state moved off VS Code workspaceState. VS Code
+    // Server's workspaceStorage gets a -N suffix per concurrent window
+    // (extHostStoragePaths.ts), so workspaceState wasn't actually a
+    // workspace-shared store on Remote-SSH -- each client window got its
+    // own isolated state.vscdb. The daemon is the natural source of truth
+    // since it's one process per remote regardless of window count.
+    //
+    // label: workspace-shared. One value per session, latest writer wins
+    //        across clients.
+    // positions: per-client. clientId is the per-laptop UUID stored in
+    //        the extension's SecretStorage (genuinely stable per local
+    //        machine even on Remote-SSH).
+    label?: string;
+    positions: Map<string, SessionPosition>;
+}
+
+// Per-(clientId, workspaceTag) selection memory: which session is "active"
+// for this client in this workspace, which is the panel-active selection,
+// and which is the editor-active selection per editor column. Lives outside
+// the Session struct because the selected session changes over time, and
+// the selection memory should survive across individual session deaths and
+// creates within the same workspace. Daemon process lifetime only -- no
+// disk persistence, same lifetime guarantee as scrollback.
+const clientSelections = new Map<string, Map<string, ClientSelection>>();
+
+function getClientSelection(clientId: string, workspaceTag: string): ClientSelection {
+    let perClient = clientSelections.get(clientId);
+    if (!perClient) {
+        perClient = new Map<string, ClientSelection>();
+        clientSelections.set(clientId, perClient);
+    }
+    let selection = perClient.get(workspaceTag);
+    if (!selection) {
+        selection = {};
+        perClient.set(workspaceTag, selection);
+    }
+    return selection;
 }
 
 interface Client {
@@ -265,6 +302,7 @@ function createSession(
         lastProcessName: '',
         shellIntegration,
         sequenceTitle: '',
+        positions: new Map<string, SessionPosition>(),
     };
 
     // Capture OSC 0/2 shell-set titles (e.g., bash PROMPT_COMMAND doing
@@ -405,7 +443,117 @@ function handleMessage(client: Client, msg: ClientMessage) {
         }
         case 'list': {
             const names = [...sessions.keys()];
-            send(client, { type: 'list_response', names });
+            // Layout-aware variant: when the client passes its UUID (and
+            // optionally the workspace tag), include each session's label
+            // and that-client's-position, plus the client's selection state
+            // for the workspace. Old single-arg callers (diagnostic
+            // command-line list) get just the names array.
+            const wantsLayout = msg.clientId !== undefined;
+            if (!wantsLayout) {
+                send(client, { type: 'list_response', names });
+                return;
+            }
+            const cid = msg.clientId!;
+            const wsPrefix = msg.workspaceTag ? `vscode-${msg.workspaceTag}-` : '';
+            const sessionsInfo: SessionLayoutInfo[] = [];
+            for (const [name, s] of sessions) {
+                if (wsPrefix && !name.startsWith(wsPrefix)) continue;
+                const position = s.positions.get(cid);
+                sessionsInfo.push({
+                    name,
+                    label: s.label,
+                    position,
+                });
+            }
+            const selection = msg.workspaceTag
+                ? clientSelections.get(cid)?.get(msg.workspaceTag)
+                : undefined;
+            send(client, {
+                type: 'list_response',
+                names,
+                sessions: sessionsInfo,
+                selection: selection ? { ...selection } : undefined,
+            });
+            return;
+        }
+        case 'set_session_label': {
+            const s = sessions.get(msg.name);
+            if (!s) {
+                send(client, { type: 'error', message: `unknown session ${msg.name}` });
+                return;
+            }
+            s.label = msg.label === null ? undefined : msg.label;
+            send(client, { type: 'layout_ack' });
+            return;
+        }
+        case 'set_session_position': {
+            const s = sessions.get(msg.name);
+            if (!s) {
+                send(client, { type: 'error', message: `unknown session ${msg.name}` });
+                return;
+            }
+            if (msg.position === null) {
+                s.positions.delete(msg.clientId);
+            } else {
+                s.positions.set(msg.clientId, msg.position);
+            }
+            send(client, { type: 'layout_ack' });
+            return;
+        }
+        case 'set_client_selection': {
+            const sel = getClientSelection(msg.clientId, msg.workspaceTag);
+            // Partial update: each provided key overwrites, including
+            // explicit undefineds (to clear a slot).
+            if ('active' in msg.selection) sel.active = msg.selection.active;
+            if ('panelActive' in msg.selection) sel.panelActive = msg.selection.panelActive;
+            if ('editorActive' in msg.selection) sel.editorActive = msg.selection.editorActive;
+            send(client, { type: 'layout_ack' });
+            return;
+        }
+        case 'clear_client_layout': {
+            // Wipes everything this client has stored for the given
+            // workspace (or for all workspaces if workspaceTag is omitted):
+            // selection state plus per-session positions filtered by the
+            // workspace prefix.
+            let cleared = 0;
+            const wsPrefix = msg.workspaceTag ? `vscode-${msg.workspaceTag}-` : '';
+            const perClient = clientSelections.get(msg.clientId);
+            if (perClient) {
+                if (msg.workspaceTag) {
+                    if (perClient.delete(msg.workspaceTag)) cleared++;
+                } else {
+                    cleared += perClient.size;
+                    perClient.clear();
+                }
+            }
+            for (const [name, s] of sessions) {
+                if (wsPrefix && !name.startsWith(wsPrefix)) continue;
+                if (s.positions.delete(msg.clientId)) cleared++;
+            }
+            send(client, { type: 'layout_ack', cleared });
+            return;
+        }
+        case 'clear_all_layouts': {
+            // Wipes every client's layout state for the given workspace
+            // (or globally if workspaceTag is omitted). Labels are
+            // workspace-shared so they go with the workspace too.
+            let cleared = 0;
+            const wsPrefix = msg.workspaceTag ? `vscode-${msg.workspaceTag}-` : '';
+            for (const perClient of clientSelections.values()) {
+                if (msg.workspaceTag) {
+                    if (perClient.delete(msg.workspaceTag)) cleared++;
+                } else {
+                    cleared += perClient.size;
+                    perClient.clear();
+                }
+            }
+            for (const [name, s] of sessions) {
+                if (wsPrefix && !name.startsWith(wsPrefix)) continue;
+                cleared += s.positions.size;
+                s.positions.clear();
+                if (s.label !== undefined) { s.label = undefined; cleared++; }
+            }
+            send(client, { type: 'layout_ack', cleared });
             return;
         }
         case 'kill': {
