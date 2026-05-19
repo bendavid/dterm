@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.10.3
+
+First marketplace publish.
+
+Tag-only release to exercise the new `publish-marketplace` CI job
+(added since 0.10.2): builds the four per-target VSIXes, gates on
+the `marketplace` GitHub Environment's required-reviewers approval,
+then `npx vsce publish --packagePath` uploads all four to the
+VS Code Marketplace under publisher `joshbendavid`.
+
+No extension code change since 0.10.2.
+
 ## 0.10.2
 
 Packaging cleanup.
