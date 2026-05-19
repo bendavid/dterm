@@ -2,7 +2,7 @@
   "name": "dterm",
   "displayName": "dterm",
   "description": "Persistent terminal sessions per workspace with auto-reattach. Self-contained — no external daemon required.",
-  "version": "0.10.0",
+  "version": "0.10.1",
   "publisher": "joshbendavid",
   "license": "MIT",
   "icon": "icon.png",
@@ -113,7 +113,9 @@
         },
         "dterm.shellArgs": {
           "type": "array",
-          "items": { "type": "string" },
+          "items": {
+            "type": "string"
+          },
           "default": [],
           "description": "Arguments passed to the shell on new sessions."
         },
@@ -132,6 +134,7 @@
     "vscode:prepublish": "npm run compile"
   },
   "dependencies": {
+    "@vscode/vsce": "^3.9.1",
     "@xterm/addon-serialize": "^0.13.0",
     "@xterm/headless": "^5.5.0",
     "node-pty": "^1.1.0"

@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.10.1
+
+Marketplace-ready metadata.
+
+- `publisher` set to `joshbendavid` (was the dev-mode `local`
+  placeholder, which the marketplace rejects).
+- `icon` set to `icon.png` (file already at repo root) so the
+  marketplace listing shows the dterm logo.
+- `keywords` added (`terminal`, `persistent`, `session`, `reattach`,
+  `tmux`, `screen`, `remote-ssh`) for marketplace search.
+- `@vscode/vsce` added as a dependency so `npx vsce package` works
+  from a fresh `npm install` without a global install.
+
+`categories` stays `["Other"]` -- the marketplace has no "Terminal"
+bucket; "Other" is the canonical home for terminal-adjacent
+extensions.
+
+No runtime code change. Re-released to produce VSIX artifacts with
+the corrected publisher embedded; the v0.10.0 artifacts were built
+with `publisher: "local"` and aren't marketplace-publishable.
+
 ## 0.10.0
 
 Move all persistent layout state from VS Code's `workspaceState` onto the
