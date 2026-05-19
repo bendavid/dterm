@@ -86,6 +86,23 @@ daemon` -- intentional, matches scrollback. The underlying daemon
 sessions tied to the layout state would be killed by the same daemon
 restart anyway, so the layout is irrelevant once they're gone.
 
+---
+
+Docs: split internals out of README into ARCHITECTURE.md.
+
+The README's "Architecture" section had grown into a debug-grade
+walkthrough of VS Code internals, lifecycle quirks, and design
+trade-offs. Moved it (plus expanded sections on shell-integration
+state replay, shell-integration nonce coordination, tab-title
+template resolution, and the workspaceState-on-Remote-SSH discovery)
+into a dedicated `ARCHITECTURE.md` at repo root, following the
+rust-analyzer / [matklad](https://matklad.github.io/2021/02/06/ARCHITECTURE.md.html)
+convention. README is now ~85 lines of user-facing intro + install +
+features + commands + settings + a single cross-link to
+ARCHITECTURE.md for contributors and debuggers. `ARCHITECTURE.md` is
+not packaged in the VSIX (added to `.vscodeignore`); it lives only
+in the repo.
+
 ## 0.9.3
 
 Honour `terminal.integrated.tabs.title` for dterm Pseudoterminals.
