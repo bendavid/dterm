@@ -1,5 +1,46 @@
 # Changelog
 
+## 0.9.2
+
+Preserve full shell-integration state across reattach via xterm-headless
+OSC dispatch.
+
+Previously the daemon scanned the raw pty stream for VS Code's one-shot
+`HasRichCommandDetection=True` advertisement and replayed only that
+sequence at reattach. Other `OSC 633 ; P ; <Key>=<Value>` properties
+(notably `Cwd`) were lost on reattach until the next shell prompt re-
+emitted them, so the visible Pseudoterminal's
+`Terminal.shellIntegration.cwd` was undefined immediately after reload
+even though the daemon-side shell was at a perfectly known cwd.
+
+- Daemon now taps xterm-headless's OSC dispatch via
+  `parser.registerOscHandler(633, ...)` -- the same hook VS Code's own
+  `shellIntegrationAddon` uses internally. xterm.js handles streaming,
+  terminator detection (BEL vs `ESC \`), and payload reassembly across
+  arbitrary chunk boundaries; the dterm-specific code is just the
+  `P;<Key>=<Value>` split plus a switch over the recognized keys.
+- Captured properties: `Cwd`, `PromptType`, `ContinuationPrompt`,
+  `Prompt`, `IsWindows`, `HasRichCommandDetection`. Per-session state,
+  latest-value-wins.
+- On reattach, the daemon prepends a serialized burst of OSC 633 ; P
+  sequences to the existing visual snapshot replay. Sent before the
+  snapshot so flags that affect downstream parser behaviour (notably
+  `HasRichCommandDetection`) are active by the time any subsequent live
+  A/B/C/D sequences arrive.
+- The old byte-scan-for-`RICH_INTEGRATION_OSC` path and the
+  `hasShellIntegration: boolean` session flag are removed -- replaced
+  by the structured `shellIntegration: ShellIntegrationState` object.
+- Round-trip fidelity: the values are stored as the bytes xterm-headless
+  hands back from its parser, so any shell-side escaping inside `Cwd`
+  values (the bash script's `__vsc_escape_value_fast` handling of `;`,
+  `\\`, `\\x07`) is preserved verbatim and the receiving VS Code parser
+  un-escapes the same way it would have originally.
+
+User-visible effect: `Terminal.shellIntegration.cwd` is populated the
+moment a reattached terminal is selected, so anything that depends on
+it (VS Code's "open file from cwd" actions, extensions reading the
+property) just works after reload.
+
 ## 0.9.1
 
 Reattach now spawns a single shared bootstrap stub instead of one per

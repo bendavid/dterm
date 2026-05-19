@@ -56,6 +56,64 @@ const DAEMON_VERSION: string = (() => {
     }
 })();
 
+// State conveyed via VS Code's `OSC 633 ; P ; <Key>=<Value>` shell-integration
+// property protocol. These values are emitted by the shell-integration init
+// script (bash/zsh/fish/pwsh) at load time or on each prompt and represent
+// session-durable state -- as opposed to the per-command lifecycle events
+// (OSC 633 ; A/B/C/D/E) which are not replayable.
+//
+// We tap xterm-headless's existing OSC 633 dispatch via parser.registerOsc
+// Handler (same hook VS Code's own shellIntegrationAddon uses internally),
+// remember the latest value per key, and re-emit all known properties at the
+// start of every late-attach replay. Without this, late-attaching or
+// reattaching clients miss the initial one-shot emissions and
+// Terminal.shellIntegration.{cwd, ...} stays empty until the next prompt.
+interface ShellIntegrationState {
+    cwd?: string;
+    promptType?: string;
+    continuationPrompt?: string;
+    prompt?: string;
+    isWindows?: boolean;
+    hasRichCommandDetection?: boolean;
+}
+
+function applyOsc633Property(payload: string, state: ShellIntegrationState): void {
+    // payload is e.g. "P;Cwd=/some/dir" or "A" or "D;0" or "E;ls -la;<nonce>".
+    // We only track P (Property) sub-commands; the others are events with no
+    // durable state to replay.
+    const semi = payload.indexOf(';');
+    const sub = semi < 0 ? payload : payload.slice(0, semi);
+    if (sub !== 'P') return;
+    const rest = payload.slice(semi + 1);
+    const eq = rest.indexOf('=');
+    if (eq < 0) return;
+    const key = rest.slice(0, eq);
+    const value = rest.slice(eq + 1);
+    switch (key) {
+        case 'Cwd':                     state.cwd = value; break;
+        case 'PromptType':              state.promptType = value; break;
+        case 'ContinuationPrompt':      state.continuationPrompt = value; break;
+        case 'Prompt':                  state.prompt = value; break;
+        case 'IsWindows':               state.isWindows = value === 'True'; break;
+        case 'HasRichCommandDetection': state.hasRichCommandDetection = value === 'True'; break;
+        // Other keys (Task, etc.) are silently ignored.
+    }
+}
+
+function serializeShellIntegrationState(s: ShellIntegrationState): string {
+    const out: string[] = [];
+    // HasRichCommandDetection first so VS Code's parser already trusts the
+    // rich-detection path for any subsequent live A/B/C/D sequences from the
+    // shell that arrive after the snapshot.
+    if (s.hasRichCommandDetection) out.push('\x1b]633;P;HasRichCommandDetection=True\x07');
+    if (s.isWindows === true)      out.push('\x1b]633;P;IsWindows=True\x07');
+    if (s.promptType !== undefined)        out.push(`\x1b]633;P;PromptType=${s.promptType}\x07`);
+    if (s.continuationPrompt !== undefined) out.push(`\x1b]633;P;ContinuationPrompt=${s.continuationPrompt}\x07`);
+    if (s.prompt !== undefined)             out.push(`\x1b]633;P;Prompt=${s.prompt}\x07`);
+    if (s.cwd !== undefined)                out.push(`\x1b]633;P;Cwd=${s.cwd}\x07`);
+    return out.join('');
+}
+
 interface Session {
     name: string;
     pty: ptyTypes.IPty;
@@ -69,20 +127,11 @@ interface Session {
     exited: boolean;
     lastProcessName: string;
     processPoller?: NodeJS.Timeout;
-    // Flips true the first time we see VS Code's shell-integration script's
-    // one-shot HasRichCommandDetection advertisement in the pty stream. The
-    // script emits this once at load time and never again; SerializeAddon
-    // doesn't preserve OSC sequences, so any client that attached after the
-    // original emission (or that attaches in a future window/reload) would
-    // miss it and the tab tooltip would stay at "basic". When this flag is
-    // true we replay the OSC into the client's stream right after the snapshot.
-    hasShellIntegration: boolean;
+    // Captured via parser.registerOscHandler in createSession. Values update
+    // continuously as the shell emits OSC 633 ; P sequences; the latest is
+    // re-emitted at every reattach replay.
+    shellIntegration: ShellIntegrationState;
 }
-
-// The exact sequence VS Code's bash/zsh/fish integration scripts emit at load
-// time. Used both as a scan target on the shell's output and as the replay
-// payload sent to late-attaching clients.
-const RICH_INTEGRATION_OSC = '\x1b]633;P;HasRichCommandDetection=True\x07';
 
 interface Client {
     socket: net.Socket;
@@ -183,6 +232,18 @@ function createSession(
     const serializeAddon = new SerializeAddon();
     emulator.loadAddon(serializeAddon as unknown as Parameters<Terminal['loadAddon']>[0]);
 
+    const shellIntegration: ShellIntegrationState = {};
+    // Tap xterm-headless's OSC dispatch for identifier 633. xterm-headless
+    // handles all the byte-level streaming, terminator detection (BEL vs
+    // ESC \), and payload reassembly across arbitrary chunk boundaries --
+    // we just receive the parsed payload and pick out the P-subcommand
+    // property values. Returning false leaves any other handlers (none in
+    // practice) free to run; xterm-headless itself doesn't act on OSC 633.
+    emulator.parser.registerOscHandler(633, payload => {
+        applyOsc633Property(payload, shellIntegration);
+        return false;
+    });
+
     const session: Session = {
         name,
         pty: ptyProc,
@@ -195,17 +256,13 @@ function createSession(
         clients: new Set(),
         exited: false,
         lastProcessName: '',
-        hasShellIntegration: false,
+        shellIntegration,
     };
     session.processPoller = setInterval(() => pollProcessName(session), 750);
     session.processPoller.unref?.();
 
     ptyProc.onData(data => {
         session.emulator.write(data);
-        if (!session.hasShellIntegration && data.includes(RICH_INTEGRATION_OSC)) {
-            session.hasShellIntegration = true;
-            log('shell integration confirmed', name);
-        }
         const buf = Buffer.from(data, 'utf8');
         const msg: DaemonMessage = { type: 'output', data: buf.toString('base64') };
         for (const c of session.clients) send(c, msg);
@@ -272,20 +329,27 @@ function handleMessage(client: Client, msg: ClientMessage) {
                 created,
             });
             if (!created) {
+                // Re-emit the latest OSC 633 ; P ; <Key>=<Value> sequences
+                // we've observed from the shell-integration script.
+                // SerializeAddon strips OSC sequences from the scrollback
+                // snapshot, so without this, Terminal.shellIntegration.{cwd,
+                // hasRichCommandDetection, ...} on the visible Pseudoterminal
+                // would be empty until the next prompt re-emits them. Sent
+                // before the visual snapshot so HasRichCommandDetection (and
+                // similar flags that affect downstream parser behaviour) is
+                // active by the time any subsequent live A/B/C/D sequences
+                // arrive. For brand-new sessions (created=true) we let the
+                // shell's own emission flow naturally to the client.
+                const integration = serializeShellIntegrationState(session.shellIntegration);
+                if (integration.length > 0) {
+                    send(client, {
+                        type: 'output',
+                        data: Buffer.from(integration, 'utf8').toString('base64'),
+                    });
+                }
                 const snap = snapshotEmulatorState(session);
                 if (snap.length > 0) {
                     send(client, { type: 'output', data: snap.toString('base64') });
-                }
-                // Replay the one-shot HasRichCommandDetection advertisement so
-                // a late-attaching client (the typical Pseudoterminal case --
-                // it connects after the bootstrap stub has already disconnected
-                // and the shell-integration script has already loaded) sees
-                // rich-detection state. The script doesn't re-emit; snapshot
-                // strips OSC. For brand-new sessions (created=true) we let the
-                // shell's own emission flow naturally to the client.
-                if (session.hasShellIntegration) {
-                    const buf = Buffer.from(RICH_INTEGRATION_OSC, 'utf8');
-                    send(client, { type: 'output', data: buf.toString('base64') });
                 }
             }
             pollProcessName(session);
