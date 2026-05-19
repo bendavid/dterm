@@ -546,18 +546,25 @@ interface ManagedSocket {
 
 // VS Code-managed Unix sockets that go stale across server restarts / client
 // reconnects. We expose a per-workspace symlink path to the shell and re-point
-// it whenever the upstream value in process.env changes -- running shells keep
-// the same env values but transparently start using the new target on the
-// next connect().
+// it whenever the upstream value rotates -- running shells keep the same env
+// values but transparently start using the new target on the next connect().
 //
-// SSH_AUTH_SOCK is standard SSH agent forwarding; VSCODE_GIT_IPC_HANDLE is
-// the askpass/credential IPC the git extension exports into terminals. We
-// don't track VSCODE_IPC_HOOK_CLI -- VS Code doesn't actually inject it into
-// standard terminals (the `code` CLI uses its own discovery), so our override
-// here was always a no-op.
+// SSH_AUTH_SOCK is standard SSH agent forwarding.
+//
+// VSCODE_GIT_IPC_HANDLE is the askpass/credential IPC the git extension
+// exports into terminals.
+//
+// VSCODE_IPC_HOOK_CLI is the per-VS-Code-terminal socket that the `code` CLI
+// connects to. Rotates per terminal spawn (each terminal gets its own
+// socket, alive only while that terminal's pty-host process is alive). Our
+// keep-alive bootstrap stub holds one bound for the lifetime of each dterm
+// session; updating this symlink on each bootstrap (new + reattach) points
+// daemon-side shells at the current stub's socket, which keeps `code` CLI
+// working across VS Code window reload.
 const MANAGED_SOCKETS: ManagedSocket[] = [
     { envVar: 'SSH_AUTH_SOCK',         linkName: 'ssh-auth.sock' },
     { envVar: 'VSCODE_GIT_IPC_HANDLE', linkName: 'vscode-git-ipc.sock' },
+    { envVar: 'VSCODE_IPC_HOOK_CLI',   linkName: 'vscode-ipc.sock' },
 ];
 
 function updateSymlinkAtomic(target: string, linkPath: string): boolean {
@@ -719,12 +726,25 @@ class DtermPseudoterminal implements vscode.Pseudoterminal {
         bootstrap.then(
             result => {
                 this.bootstrapResult = result;
+                // Update the workspace-scoped managed-socket symlinks to
+                // point at the values just captured by this bootstrap. For
+                // new sessions, the env we'll send to the daemon (with the
+                // symlink paths) is built in connect() below; for reattach,
+                // existing daemon-side shells already have the symlink paths
+                // baked in their env, and updating the symlink target here
+                // is what makes their `code` CLI / git-askpass / ssh-agent
+                // resolve to the current (post-reload) sockets without any
+                // env refresh on the shell side. Idempotent if the bootstrap
+                // for a new session already triggered an identical update
+                // via connect().
+                refreshManagedSockets(result.env);
                 if (!isReattach) {
                     this.bootstrapDone = true;
                     this.tryConnect();
                 }
                 // For reattach, bootstrapResult is recorded so close() can
-                // dispose result.stub; we don't use the captured env or args.
+                // dispose result.stub; we don't use the captured env or args
+                // beyond the managed-socket refresh above.
             },
             (e: Error) => {
                 if (!isReattach) {
