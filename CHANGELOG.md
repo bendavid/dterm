@@ -1,5 +1,59 @@
 # Changelog
 
+## 0.9.3
+
+Honour `terminal.integrated.tabs.title` for dterm Pseudoterminals.
+
+Previously dterm's visible tabs always showed the foreground process
+name verbatim because we fire Api-source titles via `onDidChangeName`
+on every daemon-side `process_name` update, and Api-source titles
+bypass VS Code's own `TerminalLabelComputer` (the `staticTitle`
+short-circuit kicks in). User customizations to
+`terminal.integrated.tabs.title` had no effect on dterm terminals.
+
+Now we resolve the user's template ourselves, every time the inputs
+change, and feed the result into the same `nameEmitter`.
+
+- `template()` ported verbatim from VS Code's
+  `src/vs/base/common/labels.ts` -- same tokeniser, same segment
+  model, same "separator collapses when surrounded by an empty"
+  filter rule. Behaviourally identical to VS Code for the variables
+  both implementations support.
+- `resolveTabTitle()` builds the variable map and applies the post-
+  processing VS Code does (strip `\n\r\t`, trim, fall back to
+  `${process}` when the resolved string is empty).
+- Supported variables: `${process}`, `${cwd}`, `${cwdFolder}`,
+  `${workspaceFolder}`, `${workspaceFolderName}`, `${workspace}`
+  (alias for `vscode.workspace.name` -- dterm-specific extension,
+  stable across multi-root), `${sequence}`, `${separator}`. Variables
+  that don't apply to dterm Pseudoterminals (`${task}`, `${local}`,
+  `${shellType}`, `${shellCommand}`, `${shellPromptInput}`,
+  `${progress}`, `${fixedDimensions}`) resolve to empty strings so
+  the separator-collapsing rule cleans up around them.
+- `${cwdFolder}` follows VS Code's rule: shown when multi-root OR
+  when cwd differs from the primary workspace folder; empty
+  otherwise.
+- `${sequence}` requires daemon-side capture (xterm-headless
+  `onTitleChange`) since the public Pseudoterminal API doesn't expose
+  VS Code's parser-side sequence-source title. New protocol message
+  `sequence_title` is broadcast on every OSC 0 / OSC 2 emission and
+  also sent on each reattach so reattached terminals get the latest
+  value immediately.
+- Re-fires happen on every input change: `process_name` and
+  `sequence_title` from the daemon, `onDidEndTerminalShellExecution`
+  for `${cwd}` updates, `onDidChangeTerminalShellIntegration` for the
+  initial cwd detection and any state change,
+  `onDidChangeConfiguration` for live tabs.title / .separator edits,
+  `onDidChangeWorkspaceFolders` for `${workspace}` /
+  `${workspaceFolder}` updates.
+- Name-locked terminals (user inline-rename or restored saved label)
+  bypass the template entirely -- same precedence VS Code's
+  `staticTitle` gives the user's explicit choice.
+
+User-visible effect: `terminal.integrated.tabs.title: "${process} -
+${cwdFolder}"` works in dterm terminals the same way it does in
+native VS Code terminals.
+
 ## 0.9.2
 
 Preserve full shell-integration state across reattach via xterm-headless

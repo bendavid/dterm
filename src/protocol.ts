@@ -23,6 +23,7 @@ export type DaemonMessage =
     | { type: 'opened'; name: string; cols: number; rows: number; created: boolean }
     | { type: 'output'; data: string }
     | { type: 'process_name'; name: string }
+    | { type: 'sequence_title'; title: string }
     | { type: 'list_response'; names: string[] }
     | { type: 'killed'; name: string }
     | { type: 'session_end'; name: string; exitCode?: number; signal?: number }

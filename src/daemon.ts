@@ -131,6 +131,13 @@ interface Session {
     // continuously as the shell emits OSC 633 ; P sequences; the latest is
     // re-emitted at every reattach replay.
     shellIntegration: ShellIntegrationState;
+    // Latest title set by the shell via OSC 0/2 (\x1b]0;<title>\x07 or
+    // \x1b]2;<title>\x07). Captured via xterm-headless's onTitleChange
+    // event. Surfaced to the extension via a sequence_title message so
+    // ${sequence} in tabs.title templates can substitute correctly even
+    // though VS Code's Pseudoterminal parser doesn't expose its own
+    // sequence-source title via the public API.
+    sequenceTitle: string;
 }
 
 interface Client {
@@ -257,7 +264,20 @@ function createSession(
         exited: false,
         lastProcessName: '',
         shellIntegration,
+        sequenceTitle: '',
     };
+
+    // Capture OSC 0/2 shell-set titles (e.g., bash PROMPT_COMMAND doing
+    // `echo -ne "\033]0;$USER@$HOSTNAME:$PWD\007"`). xterm-headless's
+    // onTitleChange already filters OSC 1 (icon-only) and dispatches only
+    // for title-setting variants. Broadcast each change to attached
+    // clients so ${sequence} in tabs.title templates can substitute it.
+    emulator.onTitleChange(title => {
+        if (session.sequenceTitle === title) return;
+        session.sequenceTitle = title;
+        const msg: DaemonMessage = { type: 'sequence_title', title };
+        for (const c of session.clients) send(c, msg);
+    });
     session.processPoller = setInterval(() => pollProcessName(session), 750);
     session.processPoller.unref?.();
 
@@ -355,6 +375,9 @@ function handleMessage(client: Client, msg: ClientMessage) {
             pollProcessName(session);
             if (session.lastProcessName) {
                 send(client, { type: 'process_name', name: session.lastProcessName });
+            }
+            if (session.sequenceTitle) {
+                send(client, { type: 'sequence_title', title: session.sequenceTitle });
             }
             return;
         }

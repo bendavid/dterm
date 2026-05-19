@@ -61,6 +61,143 @@ function nameMatchesOurSession(value: string, sessionName: string): boolean {
     return decodeSessionTag(value) === sessionName;
 }
 
+// ---------------------------------------------------------------------------
+// Tab-title template resolution.
+//
+// Honours `terminal.integrated.tabs.title` (with `terminal.integrated.tabs.
+// separator` as the ${separator} value) so the user's existing VS Code
+// customization applies to dterm terminals the same way it would to native
+// shell-binary terminals. dterm's visible Pseudoterminals fire Api-source
+// titles via onDidChangeName which bypass VS Code's own TerminalLabel
+// Computer (the staticTitle short-circuit kicks in for any Api fire), so we
+// reimplement the substitution ourselves and feed the result back through
+// the nameEmitter.
+//
+// The template() function is ported verbatim from VS Code's
+// src/vs/base/common/labels.ts -- same single-pass tokeniser, same segment
+// model (TEXT, VARIABLE, SEPARATOR), same filter rule "separator is kept
+// only when surrounded by non-empty TEXT or VARIABLE segments." Keeps us
+// behaviourally identical to VS Code's resolver for the variables both
+// sides understand. ---------------------------------------------------------------------------
+
+interface ISeparator {
+    label: string;
+}
+
+const enum SegType { TEXT, VARIABLE, SEPARATOR }
+interface Segment {
+    value: string;
+    type: SegType;
+}
+
+function template(
+    tpl: string,
+    values: Record<string, string | ISeparator | undefined | null>,
+): string {
+    const segments: Segment[] = [];
+    let inVariable = false;
+    let curVal = '';
+    for (const char of tpl) {
+        if (char === '$' || (inVariable && char === '{')) {
+            if (curVal) {
+                segments.push({ value: curVal, type: SegType.TEXT });
+            }
+            curVal = '';
+            inVariable = true;
+        } else if (char === '}' && inVariable) {
+            const resolved = values[curVal];
+            if (typeof resolved === 'string') {
+                if (resolved.length) {
+                    segments.push({ value: resolved, type: SegType.VARIABLE });
+                }
+            } else if (resolved) {
+                // ISeparator. Don't push back-to-back separators.
+                const prev = segments[segments.length - 1];
+                if (!prev || prev.type !== SegType.SEPARATOR) {
+                    segments.push({ value: resolved.label, type: SegType.SEPARATOR });
+                }
+            }
+            curVal = '';
+            inVariable = false;
+        } else {
+            curVal += char;
+        }
+    }
+    if (curVal && !inVariable) {
+        segments.push({ value: curVal, type: SegType.TEXT });
+    }
+    return segments
+        .filter((seg, i) => {
+            if (seg.type !== SegType.SEPARATOR) return true;
+            const left = segments[i - 1];
+            const right = segments[i + 1];
+            return [left, right].every(
+                s => s && (s.type === SegType.VARIABLE || s.type === SegType.TEXT) && s.value.length > 0,
+            );
+        })
+        .map(seg => seg.value)
+        .join('');
+}
+
+// Snapshot of all the inputs the tab-title template can reference. Built per
+// recompute from current Pseudoterminal state + VS Code workspace/config.
+interface TabTitleInputs {
+    process: string;
+    sequence: string;
+    cwd: string;
+    sessionId: string;
+}
+
+function resolveTabTitle(inputs: TabTitleInputs): string {
+    const cfg = vscode.workspace.getConfiguration('terminal.integrated.tabs');
+    const tpl = cfg.get<string>('title', '${process}');
+    const separator = cfg.get<string>('separator', ' - ');
+    const folders = vscode.workspace.workspaceFolders ?? [];
+    const primaryFolder = folders[0];
+    const multiRoot = folders.length > 1;
+
+    // VS Code's cwdFolder rule: only set when (multi-root) OR (cwd !=
+    // workspaceFolder path). Otherwise empty.
+    let cwdFolder = '';
+    if (inputs.cwd) {
+        if (multiRoot) {
+            cwdFolder = path.basename(inputs.cwd);
+        } else if (primaryFolder) {
+            if (path.resolve(inputs.cwd) !== primaryFolder.uri.fsPath) {
+                cwdFolder = path.basename(inputs.cwd);
+            }
+        }
+    }
+
+    // Variables that don't apply to dterm Pseudoterminals resolve to empty
+    // strings so `${task}`, `${local}`, `${shellCommand}`, etc. just disappear
+    // (and separators around them collapse). Same effect VS Code would have
+    // for a terminal where those properties happen to be undefined.
+    const values: Record<string, string | ISeparator | undefined | null> = {
+        process:               inputs.process,
+        sequence:              inputs.sequence,
+        cwd:                   inputs.cwd,
+        cwdFolder:             cwdFolder,
+        workspaceFolder:       primaryFolder ? path.basename(primaryFolder.uri.fsPath) : '',
+        workspaceFolderName:   primaryFolder?.name ?? '',
+        workspace:             vscode.workspace.name ?? '',
+        local:                 '',
+        task:                  '',
+        fixedDimensions:       '',
+        shellType:             '',
+        shellCommand:          '',
+        shellPromptInput:      '',
+        progress:              '',
+        separator:             { label: separator },
+    };
+
+    // Strip control chars VS Code strips, then trim. Empty title falls back
+    // to the process name -- same fallback VS Code uses when the template
+    // resolves to empty.
+    const result = template(tpl, values).replace(/[\n\r\t]/g, '').trim();
+    return result === '' ? inputs.process : result;
+}
+
 let activeCtx: vscode.ExtensionContext | undefined;
 let logChannel: vscode.OutputChannel | undefined;
 let daemonLogChannel: vscode.OutputChannel | undefined;
@@ -734,6 +871,12 @@ class DtermPseudoterminal implements vscode.Pseudoterminal {
     // immediately when unlocking, so the user doesn't have to wait for the
     // next daemon process_name event for the tab to update.
     private lastProcessNameSeen: string | undefined;
+    // Latest shell-set OSC 0/2 title from the daemon (`echo -ne
+    // "\033]0;...\007"`-style emissions). Feeds the ${sequence} variable in
+    // tabs.title templates; VS Code's parser on our Pseudoterminal doesn't
+    // expose its own sequence-source title via the public API, so the
+    // daemon ships it to us out-of-band over the protocol.
+    private sequenceTitle = '';
     // Async-attach state. The visible terminal is shown immediately and
     // (for new sessions) bootstrap runs in parallel so the user sees a
     // terminal in tens of ms instead of waiting for shell-integration env
@@ -972,7 +1115,12 @@ class DtermPseudoterminal implements vscode.Pseudoterminal {
                     this.writeEmitter.fire(Buffer.from(m.data, 'base64').toString('utf8'));
                     break;
                 case 'process_name':
-                    this.handleProcessName(m.name);
+                    this.lastProcessNameSeen = m.name;
+                    this.recomputeName();
+                    break;
+                case 'sequence_title':
+                    this.sequenceTitle = m.title;
+                    this.recomputeName();
                     break;
                 case 'session_end':
                     this.closeEmitter.fire(m.exitCode ?? 0);
@@ -984,27 +1132,37 @@ class DtermPseudoterminal implements vscode.Pseudoterminal {
         }
     }
 
-    private handleProcessName(name: string): void {
-        this.lastProcessNameSeen = name;
+    // Recompute the visible tab name from the current state by running it
+    // through resolveTabTitle (which honours terminal.integrated.tabs.title /
+    // .separator) and re-fire onDidChangeName. The result is wrapped via
+    // nameWithSession so the marker + tag-encoded session ID still trail
+    // the visible portion, letting getSessionFromTab decode-and-recover the
+    // session immediately. No-op when the name is locked (user inline-rename
+    // or restored saved label) -- those bypass the template entirely, same
+    // as VS Code's staticTitle short-circuit for native terminals.
+    recomputeName(): void {
         if (this.nameLocked) return;
-        // Append the marker AND the tag-encoded session ID. The encoded ID
-        // lets getSessionFromTab recover which dterm session this tab
-        // represents without relying on label matching (which would collide
-        // for unrenamed terminals all showing the same process name). The
-        // marker is the visible-vs-encoded delimiter. Both are invisible in
-        // the tab UI.
-        this.nameEmitter.fire(nameWithSession(name, this.sessionName));
+        const cwd = this.term?.shellIntegration?.cwd?.fsPath ?? '';
+        const resolved = resolveTabTitle({
+            process: this.lastProcessNameSeen ?? '',
+            sequence: this.sequenceTitle,
+            cwd,
+            sessionId: this.sessionName,
+        });
+        // Default template resolves to '' before the daemon has reported a
+        // process_name. Skip the fire in that case so we don't briefly clear
+        // the initial nameWithSession('dterm', ...) we put in TerminalOptions.
+        if (!resolved) return;
+        this.nameEmitter.fire(nameWithSession(resolved, this.sessionName));
     }
 
     // Re-enable dynamic process-name updates after a user clears their custom
     // label (by inline-renaming to empty -- VS Code's only mechanism for this).
-    // Immediately re-fires the latest known process name so the tab updates
-    // without waiting for the next daemon event.
+    // Immediately re-fires whatever the template currently resolves to so the
+    // tab updates without waiting for the next daemon event.
     unlockName(): void {
         this.nameLocked = false;
-        if (this.lastProcessNameSeen) {
-            this.nameEmitter.fire(nameWithSession(this.lastProcessNameSeen, this.sessionName));
-        }
+        this.recomputeName();
     }
 
     handleInput(data: string): void {
@@ -2038,6 +2196,33 @@ export function activate(ctx: vscode.ExtensionContext): void {
                 log(`config: pushing scrollbackLines=${lines}`);
                 await oneShot(daemonScriptPath(), { type: 'set_scrollback_lines', lines }, () => true, 500);
             }
+            if (
+                e.affectsConfiguration('terminal.integrated.tabs.title') ||
+                e.affectsConfiguration('terminal.integrated.tabs.separator')
+            ) {
+                for (const pty of ptyBySession.values()) pty.recomputeName();
+            }
+        }),
+        // Re-resolve `${cwd}` / `${cwdFolder}` after the user runs a command
+        // (cd is the common case). Also fires after the initial shell-
+        // integration handshake, which is when shellIntegration.cwd becomes
+        // available for the first time post-attach.
+        vscode.window.onDidEndTerminalShellExecution(e => {
+            const sName = sessionNameOf(e.terminal);
+            if (!sName) return;
+            ptyBySession.get(sName)?.recomputeName();
+        }),
+        // Fires when shell integration becomes active / its state updates.
+        // Covers the "cwd changed but no command-end event" edge case.
+        vscode.window.onDidChangeTerminalShellIntegration(e => {
+            const sName = sessionNameOf(e.terminal);
+            if (!sName) return;
+            ptyBySession.get(sName)?.recomputeName();
+        }),
+        // Workspace folder add/remove changes ${workspace} /
+        // ${workspaceFolder} / ${workspaceFolderName} for every session.
+        vscode.workspace.onDidChangeWorkspaceFolders(() => {
+            for (const pty of ptyBySession.values()) pty.recomputeName();
         }),
     );
 
