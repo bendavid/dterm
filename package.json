@@ -102,6 +102,11 @@
           "items": { "type": "string" },
           "default": [],
           "description": "Arguments passed to the shell on new sessions."
+        },
+        "dterm.tabTitle": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Tab-title template for dterm terminals. When non-empty, overrides `#terminal.integrated.tabs.title#` for dterm sessions only. Empty = inherit `#terminal.integrated.tabs.title#`.\n\nSupports the standard VS Code variables (`${process}`, `${cwd}`, `${cwdFolder}`, `${workspaceFolder}`, `${workspaceFolderName}`, `${sequence}`, `${separator}`) plus two dterm-specific additions:\n\n- `${session}` -- the underlying dterm session id (e.g. `vscode-myproject-1`). Stable for the lifetime of the session across reattach; useful for disambiguating multiple identically-named tabs or for debugging.\n- `${workspace}` -- alias for `vscode.workspace.name`. Stable across multi-root workspaces (returns the `.code-workspace` file name or single-folder name) where `${workspaceFolder}` only ever points at the first folder.\n\nVariables that don't apply to dterm Pseudoterminals (`${task}`, `${local}`, `${shellType}`, `${shellCommand}`, `${shellPromptInput}`, `${progress}`, `${fixedDimensions}`) resolve to empty, and the surrounding `${separator}` collapses accordingly."
         }
       }
     }

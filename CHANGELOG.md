@@ -25,11 +25,18 @@ change, and feed the result into the same `nameEmitter`.
 - Supported variables: `${process}`, `${cwd}`, `${cwdFolder}`,
   `${workspaceFolder}`, `${workspaceFolderName}`, `${workspace}`
   (alias for `vscode.workspace.name` -- dterm-specific extension,
-  stable across multi-root), `${sequence}`, `${separator}`. Variables
-  that don't apply to dterm Pseudoterminals (`${task}`, `${local}`,
-  `${shellType}`, `${shellCommand}`, `${shellPromptInput}`,
-  `${progress}`, `${fixedDimensions}`) resolve to empty strings so
-  the separator-collapsing rule cleans up around them.
+  stable across multi-root), `${session}` (dterm session id, e.g.
+  `vscode-myproject-1` -- dterm-specific), `${sequence}`,
+  `${separator}`. Variables that don't apply to dterm Pseudoterminals
+  (`${task}`, `${local}`, `${shellType}`, `${shellCommand}`,
+  `${shellPromptInput}`, `${progress}`, `${fixedDimensions}`)
+  resolve to empty strings so the separator-collapsing rule cleans
+  up around them.
+- New `dterm.tabTitle` setting (blank by default). When non-empty
+  it overrides `terminal.integrated.tabs.title` for dterm terminals
+  only -- useful for users who want a different template for dterm
+  tabs without disturbing their native-terminal customization.
+  Blank means inherit from the VS Code setting.
 - `${cwdFolder}` follows VS Code's rule: shown when multi-root OR
   when cwd differs from the primary workspace folder; empty
   otherwise.

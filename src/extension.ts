@@ -64,10 +64,12 @@ function nameMatchesOurSession(value: string, sessionName: string): boolean {
 // ---------------------------------------------------------------------------
 // Tab-title template resolution.
 //
-// Honours `terminal.integrated.tabs.title` (with `terminal.integrated.tabs.
-// separator` as the ${separator} value) so the user's existing VS Code
-// customization applies to dterm terminals the same way it would to native
-// shell-binary terminals. dterm's visible Pseudoterminals fire Api-source
+// Honours `dterm.tabTitle` if non-empty, else `terminal.integrated.tabs.
+// title` (with `terminal.integrated.tabs.separator` as the ${separator}
+// value) so the user's existing VS Code customization applies to dterm
+// terminals the same way it would to native shell-binary terminals, and a
+// dterm-only override is available for users who want a different template
+// just for dterm tabs. dterm's visible Pseudoterminals fire Api-source
 // titles via onDidChangeName which bypass VS Code's own TerminalLabel
 // Computer (the staticTitle short-circuit kicks in for any Api fire), so we
 // reimplement the substitution ourselves and feed the result back through
@@ -149,9 +151,15 @@ interface TabTitleInputs {
 }
 
 function resolveTabTitle(inputs: TabTitleInputs): string {
-    const cfg = vscode.workspace.getConfiguration('terminal.integrated.tabs');
-    const tpl = cfg.get<string>('title', '${process}');
-    const separator = cfg.get<string>('separator', ' - ');
+    // dterm.tabTitle overrides terminal.integrated.tabs.title for dterm
+    // terminals only. Blank (or whitespace-only) means inherit from the VS
+    // Code setting -- the common case where users have already customised
+    // tabs.title and want the same template applied to dterm tabs without
+    // duplication.
+    const dtermTitle = vscode.workspace.getConfiguration('dterm').get<string>('tabTitle', '').trim();
+    const tabs = vscode.workspace.getConfiguration('terminal.integrated.tabs');
+    const tpl = dtermTitle !== '' ? dtermTitle : tabs.get<string>('title', '${process}');
+    const separator = tabs.get<string>('separator', ' - ');
     const folders = vscode.workspace.workspaceFolders ?? [];
     const primaryFolder = folders[0];
     const multiRoot = folders.length > 1;
@@ -181,6 +189,7 @@ function resolveTabTitle(inputs: TabTitleInputs): string {
         workspaceFolder:       primaryFolder ? path.basename(primaryFolder.uri.fsPath) : '',
         workspaceFolderName:   primaryFolder?.name ?? '',
         workspace:             vscode.workspace.name ?? '',
+        session:               inputs.sessionId,
         local:                 '',
         task:                  '',
         fixedDimensions:       '',
@@ -2198,7 +2207,8 @@ export function activate(ctx: vscode.ExtensionContext): void {
             }
             if (
                 e.affectsConfiguration('terminal.integrated.tabs.title') ||
-                e.affectsConfiguration('terminal.integrated.tabs.separator')
+                e.affectsConfiguration('terminal.integrated.tabs.separator') ||
+                e.affectsConfiguration('dterm.tabTitle')
             ) {
                 for (const pty of ptyBySession.values()) pty.recomputeName();
             }
