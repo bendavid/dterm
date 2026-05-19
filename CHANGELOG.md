@@ -37,6 +37,32 @@ change, and feed the result into the same `nameEmitter`.
   only -- useful for users who want a different template for dterm
   tabs without disturbing their native-terminal customization.
   Blank means inherit from the VS Code setting.
+
+---
+
+New diagnostics for cross-client label-persistence triage.
+
+- `dterm: Dump persisted layout state (diagnostics)` command opens
+  a dedicated output channel with: timestamp, hostname, pid, vs
+  vscode.env.machineId, dterm clientId, workspaceTag,
+  `vscode.workspace.name`, workspaceFolder paths, the extension's
+  storageUri + the deduced workspaceStorage directory (where
+  state.vscdb lives), the globalStorageUri, every dterm-relevant
+  workspaceState key + value, the live daemon sessions for this
+  workspace tag and what getMeta() returns for each, plus the open
+  VS Code terminals and their current `t.name`.
+- `setLabel` now logs every write to the extension log (session,
+  resolved label, target key) so the timeline of rename detection
+  + persistence is visible in `dterm: Show extension log`.
+- `reconnectAll`'s per-session creation log line now includes
+  `meta=<json>` and the resolved `labelKey` so it's possible to
+  tell at a glance whether the label round-tripped.
+
+Workflow for diagnosing "renames don't survive cross-client reload":
+run the dump command on the writing client just before closing the
+window, run it again on the reattaching client right after activation,
+diff the outputs. Whichever side is missing the `session.<n>.label`
+row reveals where the persistence is breaking.
 - `${cwdFolder}` follows VS Code's rule: shown when multi-root OR
   when cwd differs from the primary workspace folder; empty
   otherwise.

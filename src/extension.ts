@@ -351,6 +351,7 @@ function getMeta(sessionName: string): SessionMeta | undefined {
 // store is the explicit rename-detection path in snapshotLabels.
 async function setLabel(sessionName: string, label: string | undefined): Promise<void> {
     if (!activeCtx) return;
+    log(`setLabel session=${sessionName} label=${JSON.stringify(label)} key=${labelKey(sessionName)}`);
     await activeCtx.workspaceState.update(labelKey(sessionName), label);
 }
 
@@ -1677,7 +1678,7 @@ async function reconnectAll(
             continue;
         }
         const meta = getMeta(name);
-        log(`reconnectAll: creating terminal for ${name} (${meta?.viewColumn !== undefined ? `col ${meta.viewColumn} idx ${meta.tabIndex ?? 0}` : `panel idx ${meta?.panelIndex ?? '?'}`})`);
+        log(`reconnectAll: creating terminal for ${name} (${meta?.viewColumn !== undefined ? `col ${meta.viewColumn} idx ${meta.tabIndex ?? 0}` : `panel idx ${meta?.panelIndex ?? '?'}`}) meta=${JSON.stringify(meta)} labelKey=${labelKey(name)}`);
         // Reattach: the daemon-side shell already exists, so we don't need
         // env/argv from a per-session bootstrap. The workspace-scoped
         // managed-socket symlinks were already refreshed up-front via the
@@ -1825,6 +1826,89 @@ async function clearLayoutState(prefixes: string[], scopeLabel: string): Promise
     }
     log(`clearLayoutState: cleared ${matching.length} entries for ${scopeLabel} (prefixes=${JSON.stringify(prefixes)})`);
     vscode.window.showInformationMessage(`dterm: cleared ${detail} for ${scopeLabel}. Reload window to see effect.`);
+}
+
+// Diagnostic: dump every dterm-related workspaceState key (with values),
+// the resolved clientId / workspaceTag / hostname / pid, both VS Code
+// storage paths the extension can see, and the result of getMeta() for
+// each live daemon session. Used to triage label/position persistence
+// issues by running on each client (the one that wrote, then the one that
+// failed to restore) and diffing the outputs.
+let dumpLayoutChannel: vscode.OutputChannel | undefined;
+async function dumpLayoutState(): Promise<void> {
+    if (!activeCtx) {
+        vscode.window.showErrorMessage('dterm: not activated yet.');
+        return;
+    }
+    if (!dumpLayoutChannel) dumpLayoutChannel = vscode.window.createOutputChannel('dterm: layout state dump');
+    const ch = dumpLayoutChannel;
+    ch.clear();
+    const live = await fetchDaemonSessions();
+    const tag = workspaceTag() ?? '(none)';
+    // Per-extension-per-workspace storage URI. The state.vscdb that holds
+    // workspaceState rows lives one directory up (workspaceStorage/<hash>/
+    // state.vscdb); print both so the user can find the right sqlite file
+    // to inspect directly if needed.
+    const extStorage = activeCtx.storageUri?.fsPath ?? '(none)';
+    const workspaceStorageDir = activeCtx.storageUri ? path.dirname(activeCtx.storageUri.fsPath) : '(none)';
+    const globalStorage = activeCtx.globalStorageUri?.fsPath ?? '(none)';
+    ch.appendLine('=== dterm layout-state dump ===');
+    ch.appendLine(`timestamp:            ${new Date().toISOString()}`);
+    ch.appendLine(`hostname:             ${os.hostname()}`);
+    ch.appendLine(`pid:                  ${process.pid}`);
+    ch.appendLine(`platform:             ${process.platform} ${process.arch}`);
+    ch.appendLine(`vscode.env.machineId: ${vscode.env.machineId}`);
+    ch.appendLine(`dterm clientId:       ${clientId}`);
+    ch.appendLine(`workspaceTag:         ${tag}`);
+    ch.appendLine(`vscode.workspace.name:${vscode.workspace.name ?? '(none)'}`);
+    ch.appendLine(`workspaceFile:        ${vscode.workspace.workspaceFile?.fsPath ?? '(none)'}`);
+    ch.appendLine(`workspaceFolders:     ${JSON.stringify((vscode.workspace.workspaceFolders ?? []).map(f => f.uri.fsPath))}`);
+    ch.appendLine(`extension storageUri: ${extStorage}`);
+    ch.appendLine(`workspaceStorage dir: ${workspaceStorageDir}`);
+    ch.appendLine(`  (state.vscdb should be at ${workspaceStorageDir}/state.vscdb)`);
+    ch.appendLine(`globalStorageUri:     ${globalStorage}`);
+    ch.appendLine('');
+    ch.appendLine('--- workspaceState keys (dterm-relevant) ---');
+    const keys = [...activeCtx.workspaceState.keys()].sort();
+    const relevant = keys.filter(k =>
+        k.startsWith('client.')
+        || (k.startsWith('session.') && k.endsWith('.label')),
+    );
+    if (relevant.length === 0) {
+        ch.appendLine('(none)');
+    } else {
+        for (const k of relevant) {
+            const v = activeCtx.workspaceState.get(k);
+            ch.appendLine(`  ${k} = ${JSON.stringify(v)}`);
+        }
+    }
+    ch.appendLine('');
+    ch.appendLine('--- live daemon sessions (this workspace) ---');
+    if (!live) {
+        ch.appendLine('(daemon unreachable)');
+    } else {
+        const prefix = tag === '(none)' ? '' : `vscode-${tag}-`;
+        const ours = live.names.filter(n => n.startsWith(prefix));
+        if (ours.length === 0) {
+            ch.appendLine('(no sessions for this workspace tag)');
+        }
+        for (const name of ours) {
+            const meta = getMeta(name);
+            ch.appendLine(`  ${name}`);
+            ch.appendLine(`    labelKey:  ${labelKey(name)}`);
+            ch.appendLine(`    metaKey:   ${metaKey(name)}`);
+            ch.appendLine(`    getMeta(): ${JSON.stringify(meta)}`);
+        }
+    }
+    ch.appendLine('');
+    ch.appendLine('--- open VS Code terminals (this window) ---');
+    for (const t of vscode.window.terminals) {
+        const sName = sessionNameOf(t);
+        if (!sName) continue;
+        ch.appendLine(`  ${sName}  t.name=${JSON.stringify(t.name)}`);
+    }
+    ch.appendLine('=== end dump ===');
+    ch.show(true);
 }
 
 // Diagnostic: compare the env of the active dterm's daemon-side shell to
@@ -2347,6 +2431,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
             () => clearLayoutState([`client.${clientId}.`], 'current client')),
         vscode.commands.registerCommand('dterm.clearLayoutForAllClients',
             () => clearLayoutState(['client.', 'session.'], 'all clients')),
+        vscode.commands.registerCommand('dterm.dumpLayoutState', () => dumpLayoutState()),
     );
 
     ctx.subscriptions.push(

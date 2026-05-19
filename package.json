@@ -76,6 +76,10 @@
       {
         "command": "dterm.clearLayoutForAllClients",
         "title": "dterm: Clear persisted layout state for all clients"
+      },
+      {
+        "command": "dterm.dumpLayoutState",
+        "title": "dterm: Dump persisted layout state (diagnostics)"
       }
     ],
     "configuration": {
