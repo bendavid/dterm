@@ -246,6 +246,15 @@ function buildShellEnv(extra: Record<string, string> | undefined): NodeJS.Proces
     const env: NodeJS.ProcessEnv = extra !== undefined ? { ...extra } : { ...process.env };
     delete env.ELECTRON_RUN_AS_NODE;
     delete env.ELECTRON_NO_ATTACH_CONSOLE;
+    // Defense-in-depth: also strip the bootstrap-internal shim-launcher
+    // plumbing. The extension already drops these before sending env, but
+    // a misbehaving / older client could leave them set and we don't want
+    // them in the user's interactive shell env.
+    delete env.DTERM_NODE_BIN;
+    delete env.DTERM_STUB_JS;
+    delete env.DTERM_BOOTSTRAP_SOCKET;
+    delete env.DTERM_SESSION;
+    delete env.DTERM_REAL_SHELL;
     return env;
 }
 

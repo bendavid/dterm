@@ -1,6 +1,7 @@
 #!/usr/bin/env node
-// Post-compile: prepare out/stub.js as an executable with shebang,
-// materialize the bash/zsh/fish/dterm symlinks VS Code dispatches against,
+// Post-compile: write out/shim-launcher.sh (the POSIX-sh launcher VS Code
+// execs as the "shell"), materialize the bash/zsh/fish/dterm symlinks
+// pointing at it (basename triggers VS Code's shell-integration injection),
 // and stamp out/build-info.json with the current git commit so an installed
 // extension can report what it was built from (the VSIX doesn't ship .git).
 const cp = require('child_process');
@@ -10,6 +11,7 @@ const path = require('path');
 const repoDir = path.join(__dirname, '..');
 const outDir = path.join(repoDir, 'out');
 const stubPath = path.join(outDir, 'stub.js');
+const launcherPath = path.join(outDir, 'shim-launcher.sh');
 
 function gitCmd(args) {
     try {
@@ -44,6 +46,14 @@ fs.writeFileSync(
     JSON.stringify(buildInfo, null, 2) + '\n',
 );
 
+// Copy the shim-launcher in from src/. It's a static POSIX-sh script
+// (see the file itself for what it does and why) -- not generated.
+fs.copyFileSync(path.join(repoDir, 'src', 'shim-launcher.sh'), launcherPath);
+fs.chmodSync(launcherPath, 0o755);
+
+// stub.js is invoked as `node stub.js` by the launcher, so it doesn't need
+// a shebang or executable bit -- but keep them anyway for the case where
+// someone wants to invoke it directly for debugging.
 const SHEBANG = '#!/usr/bin/env node\n';
 const existing = fs.readFileSync(stubPath, 'utf8');
 const body = existing.startsWith('#!')
@@ -56,23 +66,22 @@ fs.chmodSync(stubPath, 0o755);
 // kept the per-terminal CLIServer's socket bound via `exec sleep` after env
 // capture. We don't depend on the per-terminal CLIServer anymore (we route
 // `code` CLI through the extension-host's VSCODE_IPC_HOOK_CLI socket via
-// MANAGED_SOCKETS), so the launcher is gone and the stub exits immediately
-// after writing the bootstrap payload. Drop any stale file from prior builds
-// so it doesn't ship in the VSIX or confuse local repros.
+// MANAGED_SOCKETS). Drop any stale file from prior builds so it doesn't
+// ship in the VSIX or confuse local repros.
 const stalePath = path.join(outDir, 'stub-launcher.sh');
 try { fs.unlinkSync(stalePath); } catch { /* not present */ }
 
 const shimsDir = path.join(outDir, 'shims');
 fs.mkdirSync(shimsDir, { recursive: true });
 // 'bash', 'zsh', 'fish' get VS Code's automatic shell-integration injection
-// (VS Code recognizes the basename and adds --init-file / ZDOTDIR /
+// (VS Code recognizes basename(shellPath) and adds --init-file / ZDOTDIR /
 // --init-command plus VSCODE_INJECTION + VSCODE_SHELL_INTEGRATION_NONCE env).
-// The bootstrap stub then forwards that env to the daemon so the daemon-side
-// shell loads the integration script. 'dterm' is a generic fallback for
+// The launcher forwards the injected argv to stub.js, which captures it
+// and forwards to the daemon-side shell. 'dterm' is a generic fallback for
 // shells VS Code doesn't recognize -- the unrecognized basename means no
-// injection happens; DTERM_REAL_SHELL tells the stub which binary to use.
+// injection happens; DTERM_REAL_SHELL tells the daemon which binary to use.
 for (const name of ['bash', 'zsh', 'fish', 'dterm']) {
     const linkPath = path.join(shimsDir, name);
     try { fs.unlinkSync(linkPath); } catch { /* not present */ }
-    fs.symlinkSync(path.join('..', 'stub.js'), linkPath);
+    fs.symlinkSync(path.join('..', 'shim-launcher.sh'), linkPath);
 }

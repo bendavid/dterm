@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.10.5
+
+Bug fix: bootstrap on minimal containers without system `node`.
+
+When dterm ran inside a minimal dev container (e.g., AlmaLinux 10
+base, Alpine-based images) the bootstrap would hang for 10s and then
+fail with `bootstrap timeout`. Root cause: the `out/shims/<basename>`
+symlinks pointed at `out/stub.js` which carries a `#!/usr/bin/env
+node` shebang, and the kernel's shebang resolution requires `node`
+on `PATH`. VS Code Server ships its own node, but at a private path
+not on `PATH`.
+
+Fixed by introducing a tiny `out/shim-launcher.sh` (POSIX-sh,
+universally present on Unix) that the shim symlinks now point at,
+which `exec`s the node binary the extension passes in via env --
+`DTERM_NODE_BIN=process.execPath` resolves to VS Code Server's
+bundled node on Remote-SSH/dev-containers, or the Electron binary
+on desktop (with the existing `ELECTRON_RUN_AS_NODE=1` making it
+behave as node). No system `node` install required.
+
 ## 0.10.4
 
 Daemon isolation, lifecycle, and diagnostics.

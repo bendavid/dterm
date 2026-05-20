@@ -2,7 +2,7 @@
   "name": "dterm",
   "displayName": "dterm",
   "description": "Persistent terminal sessions per workspace with auto-reattach. Self-contained — no external daemon required.",
-  "version": "0.10.4",
+  "version": "0.10.5",
   "publisher": "joshbendavid",
   "license": "MIT",
   "icon": "icon.png",
