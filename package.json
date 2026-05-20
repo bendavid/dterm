@@ -76,6 +76,10 @@
         "title": "dterm: Restart daemon (kills all sessions)"
       },
       {
+        "command": "dterm.stopDaemon",
+        "title": "dterm: Stop daemon (kills all sessions)"
+      },
+      {
         "command": "dterm.pushDaemonSettings",
         "title": "dterm: Push current settings to daemon"
       },
@@ -118,6 +122,22 @@
           },
           "default": [],
           "description": "Arguments passed to the shell on new sessions."
+        },
+        "dterm.useSystemdRun": {
+          "type": "string",
+          "enum": ["auto", "always", "never"],
+          "default": "auto",
+          "enumDescriptions": [
+            "Use systemd-run --user only when it actually buys something: Linux, user-systemd accepts units, AND logind has KillUserProcesses=yes (the one case where the double-fork's reparent-to-init isn't enough). Otherwise falls back silently to double-fork.",
+            "Use systemd-run --user whenever user-systemd accepts units, even on systems where double-fork would also work. Gives you journalctl integration / systemctl --user visibility unconditionally.",
+            "Always use the legacy double-fork. Skips the systemd-run path and the linger prompt entirely."
+          ],
+          "markdownDescription": "Daemon spawn strategy on Linux. The systemd-run path runs the daemon as a transient `--user` service so it's reparented to user-systemd, visible via `systemctl --user list-units dterm-daemon`, and survives logind's `KillUserProcesses=yes`.\n\n- `auto` (default): only used when there's a real benefit -- specifically when `KillUserProcesses=yes` would have killed the double-forked daemon at session end. On the much more common `KillUserProcesses=no` configurations, double-fork is already fully durable, so nothing changes.\n- `always`: take the systemd-run path whenever user-systemd accepts units, even on `KillUserProcesses=no`. Useful if you want the `journalctl --user -u dterm-daemon` integration unconditionally.\n- `never`: always use the legacy double-fork.\n\nWhen the systemd-run path is selected, dterm checks whether lingering is enabled (`loginctl enable-linger`); if not, you'll be prompted to enable it before the first spawn. Without lingering the daemon would die on SSH disconnect, defeating the point of dterm."
+        },
+        "dterm.instanceId": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Namespace for the dterm daemon. When non-empty, dterm uses a separate daemon process, socket, log file, and session pool keyed by this id -- so the marketplace build and a locally-installed/sideloaded copy don't fight over the same sessions.\n\nLeave empty for the default (recommended). The extension auto-detects VS Code's Extension Development Host (F5 debug) and uses `dev` automatically there; this setting overrides that auto-detection.\n\nA window reload is required after changing this setting."
         },
         "dterm.tabTitle": {
           "type": "string",

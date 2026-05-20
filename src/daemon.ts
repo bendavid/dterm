@@ -1,7 +1,7 @@
 import * as net from 'net';
 import * as fs from 'fs';
 import * as path from 'path';
-import { socketPath } from './paths';
+import { sessionPrefix, socketPath } from './paths';
 import { LineStream, encode } from './protocol';
 import type { ClientMessage, DaemonMessage, SessionLayoutInfo, SessionPosition, ClientSelection } from './protocol';
 
@@ -454,7 +454,7 @@ function handleMessage(client: Client, msg: ClientMessage) {
                 return;
             }
             const cid = msg.clientId!;
-            const wsPrefix = msg.workspaceTag ? `vscode-${msg.workspaceTag}-` : '';
+            const wsPrefix = msg.workspaceTag ? sessionPrefix(msg.workspaceTag) : '';
             const sessionsInfo: SessionLayoutInfo[] = [];
             for (const [name, s] of sessions) {
                 if (wsPrefix && !name.startsWith(wsPrefix)) continue;
@@ -516,7 +516,7 @@ function handleMessage(client: Client, msg: ClientMessage) {
             // selection state plus per-session positions filtered by the
             // workspace prefix.
             let cleared = 0;
-            const wsPrefix = msg.workspaceTag ? `vscode-${msg.workspaceTag}-` : '';
+            const wsPrefix = msg.workspaceTag ? sessionPrefix(msg.workspaceTag) : '';
             const perClient = clientSelections.get(msg.clientId);
             if (perClient) {
                 if (msg.workspaceTag) {
@@ -538,7 +538,7 @@ function handleMessage(client: Client, msg: ClientMessage) {
             // (or globally if workspaceTag is omitted). Labels are
             // workspace-shared so they go with the workspace too.
             let cleared = 0;
-            const wsPrefix = msg.workspaceTag ? `vscode-${msg.workspaceTag}-` : '';
+            const wsPrefix = msg.workspaceTag ? sessionPrefix(msg.workspaceTag) : '';
             for (const perClient of clientSelections.values()) {
                 if (msg.workspaceTag) {
                     if (perClient.delete(msg.workspaceTag)) cleared++;
@@ -590,6 +590,10 @@ function handleMessage(client: Client, msg: ClientMessage) {
         }
         case 'version': {
             send(client, { type: 'version_response', version: DAEMON_VERSION });
+            return;
+        }
+        case 'get_pid': {
+            send(client, { type: 'pid_response', pid: process.pid });
             return;
         }
         case 'get_session_env': {
@@ -691,7 +695,7 @@ async function main() {
         if (process.platform !== 'win32') {
             try { fs.chmodSync(sockPath, 0o600); } catch { /* ignore */ }
         }
-        log('listening', sockPath);
+        log('listening', sockPath, 'instance=' + (process.env.DTERM_INSTANCE || '(default)'));
     });
     server.on('error', (e: NodeJS.ErrnoException) => {
         log('listen error', e);

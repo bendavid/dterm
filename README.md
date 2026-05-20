@@ -49,7 +49,8 @@ This stops VS Code from spawning an unwanted default shell in the terminal panel
 | `dterm: List sessions` | Show all live sessions across workspaces. |
 | `dterm: Show daemon log` | Open the daemon's log file. |
 | `dterm: Show diagnostics` | Print configuration, paths, and daemon state. |
-| `dterm: Restart daemon` | Kill the daemon and all live sessions. Use only when something is wedged. |
+| `dterm: Restart daemon` | Graceful shutdown via shutdown control message, then re-push settings (which lazily re-spawns the daemon). Kills all live sessions. |
+| `dterm: Stop daemon` | Graceful shutdown without re-spawning. If the daemon doesn't respond to the shutdown message within 4s, escalates to SIGKILL. The daemon comes back lazily on the next dterm operation. |
 | `dterm: Push current settings to daemon` | Re-send the current dterm.* settings to the daemon. |
 
 ## Settings
@@ -61,6 +62,8 @@ This stops VS Code from spawning an unwanted default shell in the terminal panel
 | `dterm.shell` | `""` | Override the shell executable. Empty = `$SHELL` or `/bin/bash`. |
 | `dterm.shellArgs` | `[]` | Arguments passed to the shell on new sessions. |
 | `dterm.tabTitle` | `""` | Tab-title template for dterm terminals. When non-empty, overrides `terminal.integrated.tabs.title` for dterm sessions only. Supports the standard VS Code variables (`${process}`, `${cwd}`, `${cwdFolder}`, `${workspaceFolder}`, `${workspaceFolderName}`, `${sequence}`, `${separator}`) plus `${session}` (the dterm session id) and `${workspace}` (alias for `vscode.workspace.name`, stable across multi-root). Empty = inherit `terminal.integrated.tabs.title`. |
+| `dterm.instanceId` | `""` | Namespace for the daemon. Non-empty values give the extension its own daemon, socket, log, and session pool — useful for running a locally-installed/sideloaded build alongside the marketplace one. The Extension Development Host (F5) defaults to `dev`; this setting overrides that. Reload window after changing. |
+| `dterm.useSystemdRun` | `"auto"` | Linux daemon spawn strategy: `"auto"` uses `systemd-run --user` only when logind has `KillUserProcesses=yes` (the case where the double-fork's reparent-to-init isn't enough); `"always"` uses systemd-run whenever user-systemd accepts units; `"never"` always uses the legacy double-fork. When systemd-run is selected, dterm prompts to enable lingering (`loginctl enable-linger`) the first time if it isn't already on — required so user-systemd survives SSH disconnect. The systemd-run path puts the daemon under `systemctl --user list-units dterm-daemon` / `journalctl --user -u dterm-daemon`. |
 
 ## How it compares
 

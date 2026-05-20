@@ -43,6 +43,7 @@ export type ClientMessage =
     | { type: 'detach' }
     | { type: 'set_scrollback_lines'; lines: number }
     | { type: 'shutdown' }
+    | { type: 'get_pid' }
     | { type: 'version' }
     | { type: 'get_session_env'; name: string }
     // Layout RPCs. All scoped by clientId where per-client; label is per-
@@ -66,6 +67,7 @@ export type DaemonMessage =
     | { type: 'killed'; name: string }
     | { type: 'session_end'; name: string; exitCode?: number; signal?: number }
     | { type: 'version_response'; version: string }
+    | { type: 'pid_response'; pid: number }
     | { type: 'session_env_response'; name: string; env: Record<string, string> }
     // Generic ack for the layout setters and clear commands. cleared is an
     // optional count for clear_*_layout summaries.

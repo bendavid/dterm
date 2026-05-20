@@ -5,8 +5,17 @@ import * as fs from 'fs';
 import * as cp from 'child_process';
 import * as net from 'net';
 import * as os from 'os';
-import { ensureDaemon, oneShot, readDaemonLogTail, isDaemonAlive } from './client';
-import { agentDir, daemonLogPath, socketPath } from './paths';
+import {
+    ensureDaemon,
+    oneShot,
+    readDaemonLogTail,
+    isDaemonAlive,
+    userSystemdAvailable,
+    userSystemdLingering,
+    killUserProcessesEnabled,
+    setSystemdRunLingerPrompt,
+} from './client';
+import { agentDir, daemonLogPath, instanceId, sessionPrefix, socketPath } from './paths';
 import {
     encode,
     LineStream,
@@ -727,7 +736,7 @@ async function fetchDaemonSessions(): Promise<DaemonSessions | undefined> {
 async function allocateSessionName(): Promise<string | undefined> {
     const tag = workspaceTag();
     if (!tag) return undefined;
-    const prefix = `vscode-${tag}-`;
+    const prefix = sessionPrefix(tag);
     const live = await fetchDaemonSessions();
     const used = new Set<string>(live?.names ?? []);
     for (const t of vscode.window.terminals) {
@@ -761,6 +770,94 @@ async function pushScrollbackLines(): Promise<void> {
 
 async function pushAllDaemonSettings(): Promise<void> {
     await pushScrollbackLines();
+}
+
+// Stop the daemon. Two-stage:
+//   1. Graceful: send `shutdown` over the protocol, wait for socket to
+//      disappear (the daemon kills its sessions then process.exit(0)s).
+//   2. Escalation: if the socket is still present after the timeout, the
+//      daemon is wedged -- ask for the pid via the protocol (short timeout)
+//      or fall back to socket-holder lookup, SIGKILL it, and unlink any
+//      stale socket file so the next spawn doesn't see a false-positive.
+// Doesn't re-spawn -- the daemon comes back lazily on the next dterm
+// operation. Distinct from restartDaemon, which re-pushes settings (and
+// thereby implicitly re-spawns the daemon via the next oneShot call).
+async function stopDaemon(): Promise<void> {
+    const confirm = await vscode.window.showWarningMessage(
+        'dterm: stop the daemon? This terminates every live session (every shell process across all workspaces sharing this daemon). The daemon will lazily restart on the next dterm operation.',
+        { modal: true },
+        'Stop daemon',
+    );
+    if (confirm !== 'Stop daemon') {
+        log('stopDaemon: cancelled');
+        return;
+    }
+    log('stopDaemon: sending shutdown');
+    await oneShot(daemonScriptPath(), { type: 'shutdown' }, () => true, 500);
+    const sock = socketPath();
+    let gone = false;
+    for (let i = 0; i < 40; i++) {
+        await new Promise(r => setTimeout(r, 100));
+        try { fs.statSync(sock); } catch { gone = true; break; }
+    }
+    if (gone) {
+        vscode.window.showInformationMessage('dterm: daemon stopped.');
+        return;
+    }
+    // Graceful path timed out -- escalate to SIGKILL.
+    log('stopDaemon: graceful shutdown timed out, escalating to SIGKILL');
+    let pid: number | undefined;
+    const resp = await oneShot(
+        daemonScriptPath(),
+        { type: 'get_pid' },
+        m => m.type === 'pid_response',
+        1000,
+    );
+    if (resp && resp.type === 'pid_response') {
+        pid = resp.pid;
+        log(`stopDaemon: daemon reports pid=${pid}`);
+    } else {
+        log('stopDaemon: daemon did not respond to get_pid; trying socket-holder lookup');
+        // Ask the kernel who's listening on the socket inode. ss is
+        // universally present on modern Linux; lsof/fuser as fallbacks.
+        for (const probe of [
+            ['ss', ['-lpxnH', 'src', sock]],
+            ['lsof', ['-t', sock]],
+            ['fuser', [sock]],
+        ] as const) {
+            try {
+                const r = cp.spawnSync(probe[0], probe[1], { encoding: 'utf8', timeout: 1500 });
+                if (r.status === 0) {
+                    const m = (r.stdout || '').match(/(\d{2,})/);
+                    if (m) { pid = parseInt(m[1], 10); break; }
+                }
+            } catch { /* probe not available */ }
+        }
+        if (pid !== undefined) log(`stopDaemon: socket-holder lookup found pid=${pid}`);
+    }
+    if (pid !== undefined) {
+        try {
+            process.kill(pid, 'SIGKILL');
+            log(`stopDaemon: sent SIGKILL to pid=${pid}`);
+        } catch (e) {
+            log(`stopDaemon: kill failed: ${(e as Error).message}`);
+        }
+    }
+    // Poll for the socket to disappear (kernel removes it shortly after the
+    // listener dies); if it lingers, unlink so the next spawn isn't fooled.
+    for (let i = 0; i < 30; i++) {
+        await new Promise(r => setTimeout(r, 100));
+        try { fs.statSync(sock); } catch { break; }
+    }
+    try { fs.unlinkSync(sock); log(`stopDaemon: unlinked stale socket ${sock}`); } catch { /* gone */ }
+    let stillThere = false;
+    try { fs.statSync(sock); stillThere = true; } catch { /* gone */ }
+    if (!stillThere) {
+        const pidNote = pid !== undefined ? ` (graceful timed out; SIGKILL'd pid ${pid})` : ' (graceful timed out; cleaned up stale socket)';
+        vscode.window.showInformationMessage(`dterm: daemon stopped${pidNote}.`);
+    } else {
+        vscode.window.showWarningMessage('dterm: failed to fully stop the daemon -- socket still present. Check process state manually.');
+    }
 }
 
 function effectiveScrollbackLines(): number {
@@ -1417,7 +1514,7 @@ function buildPseudoOptions(
 // the stub via DTERM_BOOTSTRAP_SOCKET) and a promise that resolves with the
 // parsed payload once the stub has written it. Cleans the socket file +
 // closes the server in all exit paths.
-function setupBootstrapSocket(sessionName: string): {
+function setupBootstrapSocket(): {
     sockPath: string;
     cleanup: () => void;
     payload: Promise<BootstrapResult>;
@@ -1426,9 +1523,16 @@ function setupBootstrapSocket(sessionName: string): {
     const tag = workspaceTag() ?? 'noworkspace';
     const dir = agentDir(tag);
     try { fs.mkdirSync(dir, { recursive: true, mode: 0o700 }); } catch { /* exists */ }
+    // Random-suffix only -- don't embed sessionName. Linux's sun_path is 108
+    // bytes and dir + sessionName + hex was bumping right against that limit
+    // (and going over when a non-empty dterm.instanceId widens both the
+    // agent dir and the vscode-<inst>-<tag>-N session prefix). Random hex
+    // alone is unique within the workspace-scoped dir; the socket is
+    // single-use and unlinked the moment the stub connects, so even a
+    // collision would only retry-once.
     const sockPath = path.join(
         dir,
-        `bootstrap-${sessionName}-${crypto.randomBytes(6).toString('hex')}.sock`,
+        `bootstrap-${crypto.randomBytes(6).toString('hex')}.sock`,
     );
     try { fs.unlinkSync(sockPath); } catch { /* not there */ }
     const server = net.createServer();
@@ -1495,7 +1599,7 @@ async function bootstrapShell(
     cwd: string | undefined,
     shellIntegrationNonce: string | undefined,
 ): Promise<BootstrapResult> {
-    const { sockPath, cleanup, payload } = setupBootstrapSocket(sessionName);
+    const { sockPath, cleanup, payload } = setupBootstrapSocket();
     const stub = vscode.window.createTerminal(
         buildBootstrapStubOptions(sessionName, sockPath, cwd, shellIntegrationNonce),
     );
@@ -1622,7 +1726,7 @@ async function reconnectAll(
         }
         return;
     }
-    const prefix = `vscode-${tag}-`;
+    const prefix = sessionPrefix(tag);
     const live = await fetchDaemonSessions();
     log(`reconnectAll: live=${live === undefined ? 'undefined (daemon unreachable)' : JSON.stringify(live.names)}`);
     if (live === undefined) {
@@ -1883,7 +1987,10 @@ async function dumpLayoutState(): Promise<void> {
         vscode.window.showErrorMessage('dterm: not activated yet.');
         return;
     }
-    if (!dumpLayoutChannel) dumpLayoutChannel = vscode.window.createOutputChannel('dterm: layout state dump');
+    const inst = instanceId();
+    if (!dumpLayoutChannel) dumpLayoutChannel = vscode.window.createOutputChannel(
+        `dterm: layout state dump${inst ? ` (${inst})` : ''}`,
+    );
     const ch = dumpLayoutChannel;
     ch.clear();
     const tag = workspaceTag() ?? '(none)';
@@ -1897,6 +2004,7 @@ async function dumpLayoutState(): Promise<void> {
     ch.appendLine(`platform:             ${process.platform} ${process.arch}`);
     ch.appendLine(`vscode.env.machineId: ${vscode.env.machineId}`);
     ch.appendLine(`dterm clientId:       ${clientId}`);
+    ch.appendLine(`dterm instance:       ${inst || '(default)'}`);
     ch.appendLine(`workspaceTag:         ${tag}`);
     ch.appendLine(`vscode.workspace.name:${vscode.workspace.name ?? '(none)'}`);
     ch.appendLine(`workspaceFile:        ${vscode.workspace.workspaceFile?.fsPath ?? '(none)'}`);
@@ -1909,7 +2017,7 @@ async function dumpLayoutState(): Promise<void> {
     if (!live) {
         ch.appendLine('(daemon unreachable)');
     } else {
-        const prefix = tag === '(none)' ? '' : `vscode-${tag}-`;
+        const prefix = tag === '(none)' ? '' : sessionPrefix(tag);
         const ours = live.names.filter(n => n.startsWith(prefix));
         if (ours.length === 0) {
             ch.appendLine('(no sessions for this workspace tag)');
@@ -1991,7 +2099,9 @@ async function checkEnvFreshness(): Promise<void> {
     // without that, refreshManagedSockets would skip them and the diagnostic
     // would report them as drift.
     Object.assign(freshEnv, refreshManagedSockets(freshResult.env));
-    const ch = vscode.window.createOutputChannel('dterm: env freshness');
+    const ch = vscode.window.createOutputChannel(
+        `dterm: env freshness${instanceId() ? ` (${instanceId()})` : ''}`,
+    );
     renderEnvDiff(ch, sessionName, sessionEnv, freshEnv);
     ch.show(true);
 }
@@ -2202,8 +2312,89 @@ async function ensureNodePty(ctx: vscode.ExtensionContext): Promise<boolean> {
     return true;
 }
 
+// Called by client.ts at first systemd-run spawn when lingering isn't
+// enabled for this user. Returns true if the user opted to enable
+// lingering and the `loginctl enable-linger` call succeeded; false if
+// the user declined or the call failed (caller falls back to double-fork).
+async function promptForLingering(): Promise<boolean> {
+    const uname = process.env.USER || process.env.LOGNAME || '';
+    const choice = await vscode.window.showInformationMessage(
+        `dterm wants to launch the daemon under user-systemd (systemd-run --user) `
+        + `for stronger lifecycle isolation. This needs lingering enabled for `
+        + `your user (loginctl enable-linger ${uname}) so user-systemd survives `
+        + `session end; otherwise SSH disconnect would kill the daemon.`,
+        'Enable lingering',
+        'Use double-fork',
+    );
+    if (choice !== 'Enable lingering') {
+        log(`linger prompt: user chose ${JSON.stringify(choice)}, falling back to double-fork`);
+        return false;
+    }
+    try {
+        const r = cp.spawnSync('loginctl', ['enable-linger', uname], {
+            stdio: 'pipe',
+            encoding: 'utf8',
+            timeout: 5000,
+        });
+        if (r.status === 0 && userSystemdLingering()) {
+            log('linger prompt: enabled via loginctl');
+            return true;
+        }
+        const stderr = (r.stderr || '').trim() || `(no stderr, exit=${r.status})`;
+        log(`linger prompt: loginctl failed: ${stderr}`);
+        void vscode.window.showErrorMessage(
+            `dterm: failed to enable lingering: ${stderr}. `
+            + `Run "loginctl enable-linger" manually, or set dterm.useSystemdRun to "never".`,
+        );
+        return false;
+    } catch (e) {
+        log(`linger prompt: loginctl spawn threw: ${(e as Error).message}`);
+        return false;
+    }
+}
+
+// Resolve the dterm instance namespace used to keep prod and dev (F5) daemons
+// from colliding. The explicit dterm.instanceId setting wins; otherwise the
+// dev-mode auto-detect kicks in. Must run before any paths.ts helper is
+// called, since they read DTERM_INSTANCE from the process env.
+function resolveInstance(ctx: vscode.ExtensionContext): string {
+    const override = (vscode.workspace
+        .getConfiguration('dterm')
+        .get<string>('instanceId', '') || '')
+        .trim();
+    if (override) return override;
+    if (ctx.extensionMode === vscode.ExtensionMode.Development) return 'dev';
+    return '';
+}
+
 export function activate(ctx: vscode.ExtensionContext): void {
     activeCtx = ctx;
+    // Stamp the env BEFORE any path helper runs so socket/log/agent paths and
+    // the spawned daemon all see the same instance. The daemon inherits this
+    // env var through the double-fork spawn in client.ts.
+    const instance = resolveInstance(ctx);
+    if (instance) process.env.DTERM_INSTANCE = instance;
+    else delete process.env.DTERM_INSTANCE;
+    // Resolve the systemd-run spawn strategy. Tri-state setting:
+    //   never  -> always double-fork
+    //   always -> systemd-run when user-systemd accepts units
+    //   auto   -> systemd-run only when KillUserProcesses=true (the one
+    //             case the double-fork's reparent-to-init doesn't survive)
+    // The actual linger check / prompt happens at spawn time via the
+    // hook registered below, since linger state can change between
+    // activate and first spawn.
+    const sysrunMode = vscode.workspace
+        .getConfiguration('dterm')
+        .get<string>('useSystemdRun', 'auto');
+    let wantSystemdRun = false;
+    if (sysrunMode === 'always') {
+        wantSystemdRun = userSystemdAvailable();
+    } else if (sysrunMode === 'auto') {
+        wantSystemdRun = userSystemdAvailable() && killUserProcessesEnabled() === true;
+    }
+    if (wantSystemdRun) process.env.DTERM_USE_SYSTEMD_RUN = '1';
+    else delete process.env.DTERM_USE_SYSTEMD_RUN;
+    setSystemdRunLingerPrompt(wantSystemdRun ? promptForLingering : undefined);
     void ensureNodePty(ctx);
 
     ctx.subscriptions.push(
@@ -2211,7 +2402,9 @@ export function activate(ctx: vscode.ExtensionContext): void {
             async provideTerminalProfile() {
                 const cwd = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
                 const allocated = await allocateSessionName();
-                const sessionName = allocated ?? `vscode-noworkspace-${process.pid}-${Date.now()}`;
+                const inst = instanceId();
+                const noWsPrefix = inst ? `vscode-${inst}-noworkspace` : 'vscode-noworkspace';
+                const sessionName = allocated ?? `${noWsPrefix}-${process.pid}-${Date.now()}`;
                 if (!allocated) log(`profile: allocating fallback session ${sessionName}`);
                 else log(`profile: allocated session ${sessionName}`);
                 pendingFocus.add(sessionName);
@@ -2391,9 +2584,12 @@ export function activate(ctx: vscode.ExtensionContext): void {
         }),
     );
 
-    logChannel = vscode.window.createOutputChannel('dterm');
+    const inst = instanceId();
+    const channelSuffix = inst ? ` (${inst})` : '';
+    logChannel = vscode.window.createOutputChannel(`dterm${channelSuffix}`);
     ctx.subscriptions.push(logChannel);
     log(`activate: extensionPath=${ctx.extensionPath}`);
+    log(`activate: instance=${inst || '(default)'} extensionMode=${ctx.extensionMode}`);
     log(`activate: workspaceTag=${workspaceTag() ?? '(none)'}`);
     refreshManagedSockets();
 
@@ -2413,6 +2609,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
                 vscode.window.showWarningMessage('dterm: daemon did not respond after restart.');
             }
         }),
+        vscode.commands.registerCommand('dterm.stopDaemon', () => stopDaemon()),
     );
 
     ctx.subscriptions.push(
@@ -2435,6 +2632,16 @@ export function activate(ctx: vscode.ExtensionContext): void {
                 session: sessionNameOf(t),
             }));
             ch.appendLine('--- dterm diagnostics ---');
+            ch.appendLine(`instance: ${instanceId() || '(default)'}`);
+            const sysrunMode = vscode.workspace
+                .getConfiguration('dterm')
+                .get<string>('useSystemdRun', 'auto');
+            const kup = killUserProcessesEnabled();
+            ch.appendLine(`useSystemdRun setting: ${sysrunMode}`);
+            ch.appendLine(`  user-systemd available: ${userSystemdAvailable()}`);
+            ch.appendLine(`  user-systemd lingering: ${userSystemdLingering()}`);
+            ch.appendLine(`  logind KillUserProcesses: ${kup === undefined ? '(unknown)' : kup}`);
+            ch.appendLine(`  resolved want-systemd-run: ${process.env.DTERM_USE_SYSTEMD_RUN === '1'} (effective strategy is recorded in the daemon log header)`);
             ch.appendLine(`workspaceTag: ${tag}`);
             ch.appendLine(`socket: ${sock} exists=${sockExists}`);
             ch.appendLine(`live sessions: ${live === undefined ? '(daemon unreachable)' : JSON.stringify(live.names)}`);
@@ -2461,7 +2668,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
         vscode.commands.registerCommand('dterm.showDaemonLog', () => {
             // Separate channel from the extension's own log so peeking at the
             // daemon tail doesn't clobber lifecycle/diagnostics output from log().
-            if (!daemonLogChannel) daemonLogChannel = vscode.window.createOutputChannel('dterm: daemon log');
+            if (!daemonLogChannel) daemonLogChannel = vscode.window.createOutputChannel(`dterm: daemon log${channelSuffix}`);
             const tail = readDaemonLogTail(64 * 1024);
             daemonLogChannel.clear();
             daemonLogChannel.appendLine(`# daemon log: ${daemonLogPath()}`);
@@ -2485,7 +2692,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
                 return;
             }
             const tag = workspaceTag();
-            const prefix = tag ? `vscode-${tag}-` : undefined;
+            const prefix = tag ? sessionPrefix(tag) : undefined;
             const ours: string[] = [];
             const others: string[] = [];
             for (const n of live.names) {
