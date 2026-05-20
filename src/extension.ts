@@ -757,6 +757,44 @@ function daemonScriptPath(): string {
     return path.join(activeCtx.extensionPath, 'out', 'daemon.js');
 }
 
+interface BuildInfo {
+    commit?: string;
+    commitShort?: string;
+    commitDate?: string;
+    dirty?: boolean;
+    builtAt?: string;
+}
+
+// Read the build-info.json that postcompile.js stamps with `git rev-parse`
+// output. Lets an installed extension report which commit it was built
+// from (the VSIX doesn't ship .git). Cached after first read since the
+// file doesn't change at runtime.
+let buildInfoCache: BuildInfo | undefined;
+let buildInfoRead = false;
+function getBuildInfo(): BuildInfo | undefined {
+    if (buildInfoRead) return buildInfoCache;
+    buildInfoRead = true;
+    if (!activeCtx) return undefined;
+    try {
+        const raw = fs.readFileSync(
+            path.join(activeCtx.extensionPath, 'out', 'build-info.json'),
+            'utf8',
+        );
+        buildInfoCache = JSON.parse(raw) as BuildInfo;
+    } catch { /* missing or malformed */ }
+    return buildInfoCache;
+}
+
+function formatBuildInfo(): string {
+    const bi = getBuildInfo();
+    if (!bi) return '(unknown)';
+    const sha = bi.commitShort || bi.commit || '(unknown)';
+    const dirty = bi.dirty === true ? '-dirty' : '';
+    const date = bi.commitDate ? ` (${bi.commitDate})` : '';
+    const builtAt = bi.builtAt ? `, built ${bi.builtAt}` : '';
+    return `${sha}${dirty}${date}${builtAt}`;
+}
+
 async function pushScrollbackLines(): Promise<void> {
     const lines = effectiveScrollbackLines();
     log(`config: pushing scrollbackLines=${lines}`);
@@ -2005,6 +2043,7 @@ async function dumpLayoutState(): Promise<void> {
     ch.appendLine(`vscode.env.machineId: ${vscode.env.machineId}`);
     ch.appendLine(`dterm clientId:       ${clientId}`);
     ch.appendLine(`dterm instance:       ${inst || '(default)'}`);
+    ch.appendLine(`dterm build:          ${formatBuildInfo()}`);
     ch.appendLine(`workspaceTag:         ${tag}`);
     ch.appendLine(`vscode.workspace.name:${vscode.workspace.name ?? '(none)'}`);
     ch.appendLine(`workspaceFile:        ${vscode.workspace.workspaceFile?.fsPath ?? '(none)'}`);
@@ -2632,6 +2671,9 @@ export function activate(ctx: vscode.ExtensionContext): void {
                 session: sessionNameOf(t),
             }));
             ch.appendLine('--- dterm diagnostics ---');
+            const ver = activeCtx?.extension.packageJSON?.version ?? '(unknown)';
+            ch.appendLine(`version: ${ver}`);
+            ch.appendLine(`build: ${formatBuildInfo()}`);
             ch.appendLine(`instance: ${instanceId() || '(default)'}`);
             const sysrunMode = vscode.workspace
                 .getConfiguration('dterm')
