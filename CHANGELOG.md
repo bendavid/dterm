@@ -1,5 +1,55 @@
 # Changelog
 
+## 0.10.4
+
+Daemon isolation, lifecycle, and diagnostics.
+
+- **Instance namespacing.** New `dterm.instanceId` setting (default
+  empty) namespaces the daemon socket, log, agent dir, and session
+  prefix so a dev / sideload build can coexist with the marketplace
+  install. The Extension Development Host (F5) auto-resolves to
+  instance `dev`. Plumbed through `paths.ts` via
+  `process.env.DTERM_INSTANCE` so the daemon inherits the same
+  resolution.
+- **systemd-run spawn path.** New `dterm.useSystemdRun` setting
+  (tri-state `"auto" | "always" | "never"`, default `"auto"`). When
+  selected, the daemon runs as a transient `--user` service
+  (`dterm-daemon[-<inst>].service`), reparented to user-systemd
+  rather than init, so it survives logind's `KillUserProcesses=yes`
+  and is visible via `systemctl --user status dterm-daemon` /
+  `journalctl --user -u dterm-daemon`. `"auto"` only takes the
+  systemd-run path when logind reports `KillUserProcesses=true`
+  (detected via `busctl get-property`), since on the much more
+  common `KillUserProcesses=no` configurations the legacy
+  double-fork is already fully durable. Lingering is required (else
+  user-systemd would terminate on SSH disconnect, defeating dterm's
+  purpose); when missing, the user is prompted with **Enable
+  lingering** (runs `loginctl enable-linger`) or **Use double-fork**
+  (falls back this session). The double-fork remains the universal
+  fallback on non-Linux, on systems without user-systemd, and when
+  `systemd-run` itself fails.
+- **`dterm: Stop daemon` command.** Graceful protocol-based
+  shutdown that doesn't push settings afterwards (so no implicit
+  respawn -- the daemon comes back lazily on the next operation).
+  Escalates to SIGKILL when the graceful path times out: queries
+  the daemon for its pid via a new `get_pid` protocol message, falls
+  back to `ss`/`lsof`/`fuser` socket-holder lookup if the daemon is
+  wedged, then unlinks any stale socket file.
+- **Bug fix: bootstrap socket path length.** The per-session
+  bootstrap socket previously included the session name in its
+  filename, which combined with a non-empty `instanceId` and a
+  typical workspace tag exceeded Linux's 108-byte `sun_path` limit
+  -- terminal create would hang then exit 1. Drop the session name
+  from the filename (`agentDir + random hex` is already unique
+  within the workspace).
+- **Build-info diagnostics.** `scripts/postcompile.js` now stamps
+  `out/build-info.json` with the current git commit (full +
+  12-char short), commit date, working-tree dirty flag, and build
+  timestamp. The extension surfaces a one-line summary in `dterm:
+  Show diagnostics` and `dterm: Dump persisted layout state` so
+  marketplace-installed users can identify which source tree their
+  extension was built from.
+
 ## 0.10.3
 
 First marketplace publish.
